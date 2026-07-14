@@ -1,0 +1,7 @@
+.agents/
+logs/
+__pycache__/
+*.py[cod]
+*.wbproj
+runtime.ini
+*.code-workspace
