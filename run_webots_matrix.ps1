@@ -53,18 +53,19 @@ foreach ($world in $worlds) {
           -RedirectStandardOutput (Join-Path $matrixDir "$tag.laptop.out.txt") `
           -RedirectStandardError (Join-Path $matrixDir "$tag.laptop.err.txt")
 
-        $finished = $laptopProcess.WaitForExit(900000)
+        $finished = $laptopProcess.WaitForExit(150000)
         if (-not $finished) {
             Stop-ProcessTree $laptopProcess.Id
         }
         Stop-ProcessTree $webotsProcess.Id
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 5
 
         $runDir = Get-ChildItem (Join-Path $root 'logs') -Directory |
             Where-Object FullName -notin $before |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
         $summaryPath = if ($runDir) { Join-Path $runDir.FullName 'run_summary.json' }
+        $collisionPath = if ($runDir) { Join-Path $runDir.FullName 'webots_collision.json' }
         if ($runDir -and (Test-Path $summaryPath)) {
             $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
             [pscustomobject]@{
@@ -79,12 +80,17 @@ foreach ($world in $worlds) {
                 run_dir = $runDir.Name
             } | ConvertTo-Json -Compress | Tee-Object -FilePath (Join-Path $matrixDir 'results.jsonl') -Append
         } else {
+            $collision = if ($collisionPath -and (Test-Path $collisionPath)) {
+                [bool](Get-Content $collisionPath -Raw | ConvertFrom-Json).detected
+            } else {
+                $null
+            }
             [pscustomobject]@{
                 case = $case
                 total = $total
                 world = $world.Name
                 switch = $combination
-                collision = $null
+                collision = $collision
                 stop_reason = if ($finished) { 'missing_summary' } else { 'timeout' }
                 mission_complete = $false
                 elapsed_s = $null

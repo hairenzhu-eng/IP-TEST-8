@@ -497,13 +497,9 @@ def selected_run_dirs(logs_dir, run_dirs):
 
 
 def segment_for_plot(record, padding_s):
-    start_s, end_s = record.active_window_s
+    start_s, _ = record.active_window_s
     lower_s = max(record.trajectory_time_s[0], start_s - padding_s)
-    upper_s = min(record.trajectory_time_s[-1], end_s + padding_s)
-    mask = (
-        (record.trajectory_time_s >= lower_s)
-        & (record.trajectory_time_s <= upper_s)
-    )
+    mask = record.trajectory_time_s >= lower_s
     if np.count_nonzero(mask) < 2:
         return record.trajectory_ne_m
     return record.trajectory_ne_m[mask]
