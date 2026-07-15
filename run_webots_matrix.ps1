@@ -32,6 +32,7 @@ foreach ($world in $worlds) {
         $tag = '{0:D2}_{1}_{2}' -f $case, $world.BaseName, $combination
         $before = @(Get-ChildItem (Join-Path $root 'logs') -Directory | ForEach-Object FullName)
         $env:SWITCH_COMBINATION = $combination
+        $env:WEBOTS_WORLD = $world.FullName
         Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
         Write-Output "START $case/$total world=$($world.Name) switch=$combination"
 
@@ -53,7 +54,7 @@ foreach ($world in $worlds) {
           -RedirectStandardOutput (Join-Path $matrixDir "$tag.laptop.out.txt") `
           -RedirectStandardError (Join-Path $matrixDir "$tag.laptop.err.txt")
 
-        $finished = $laptopProcess.WaitForExit(150000)
+        $finished = $laptopProcess.WaitForExit(130000)
         if (-not $finished) {
             Stop-ProcessTree $laptopProcess.Id
         }

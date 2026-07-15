@@ -24,13 +24,12 @@ def classify_colreg_zone(bearing_deg, relative_heading_deg, emergency=False):
 
     if zone_a:
         if 157.5 <= heading < 202.5:
-            return "head_on", -1.0, "COLREG Rule 14: both alter to starboard"
+            return "head_on", 1.0, "COLREG Rule 14: both alter to starboard"
         if 67.5 <= heading < 157.5:
             return "crossing_from_port", 0.0, "COLREG Rule 15: stand on"
         if 202.5 <= heading < 292.5:
             return "crossing_from_starboard", -1.0, "COLREG Rule 15: give way, pass astern"
-        side = -1.0 if heading >= 292.5 else 1.0
-        return "overtaking", side, "COLREG Rule 13: overtake on the selected side"
+        return "overtaking", 1.0, "COLREG Rule 13: overtake to starboard"
 
     if zone_b and heading < 180.0:
         return (

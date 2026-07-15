@@ -4,10 +4,10 @@ from colreg_apf import classify_colreg_zone, obstacle_stern_waypoint, smooth_ell
 
 
 def test_colreg_four_zone_rules():
-    assert classify_colreg_zone(0.0, 180.0)[0:2] == ("head_on", -1.0)
+    assert classify_colreg_zone(0.0, 180.0)[0:2] == ("head_on", 1.0)
     assert classify_colreg_zone(0.0, 100.0)[0:2] == ("crossing_from_port", 0.0)
     assert classify_colreg_zone(0.0, 250.0)[0:2] == ("crossing_from_starboard", -1.0)
-    assert classify_colreg_zone(0.0, 350.0)[0:2] == ("overtaking", -1.0)
+    assert classify_colreg_zone(0.0, 350.0)[0:2] == ("overtaking", 1.0)
     assert classify_colreg_zone(0.0, 10.0)[0:2] == ("overtaking", 1.0)
     assert classify_colreg_zone(300.0, 90.0)[0:2] == ("crossing_from_port", 0.0)
     assert classify_colreg_zone(300.0, 90.0, emergency=True)[0:2] == ("crossing_from_port", -1.0)
@@ -36,6 +36,35 @@ def test_crossing_passes_astern():
     ) == -1.0
     assert controller.apf_pass_astern_side_from_velocity([0.0, -1.0]) == 1.0
     assert np.allclose(obstacle_stern_waypoint([5.0, 2.0], [0.0, 1.0], 3.0), [5.0, -1.0])
+
+
+def test_repulsion_uses_the_locked_colreg_side():
+    from laptop import LaptopController
+
+    controller = LaptopController.__new__(LaptopController)
+    controller.__dict__.update(
+        timefromstart=0.0,
+        apf_last_dynamic_field_s=-np.inf,
+        apf_overtaking_params={},
+        apf_dynamic_speed_threshold_m_s=0.05,
+    )
+    controller._dynamic_ellipse_repulsion = lambda *_args: (np.array([2.0, 1.0]), True)
+    controller._obstacle_body_position = lambda _obstacle: np.array([1.0, 0.0])
+    controller._obstacle_body_velocity = lambda _obstacle: np.array([-1.0, 0.0])
+    controller.current_velocity_body = lambda: np.array([1.0, 0.0])
+    controller.apf_classify_encounter = lambda *_args: ("head_on", 1.0, "head-on")
+    controller.apf_cpa_metrics = lambda *_args: (2.0, 0.5)
+    controller.apf_lock_side = lambda requested, _level: requested
+
+    force, active, _ = controller.apf_repulsion_for_obstacle({}, None, None)
+    assert active and np.allclose(force, [2.0, 1.0])
+
+    controller.apf_classify_encounter = lambda *_args: (
+        "crossing_from_starboard", 1.0, "crossing"
+    )
+    controller._obstacle_body_velocity = lambda _obstacle: np.array([0.0, -1.0])
+    force, active, _ = controller.apf_repulsion_for_obstacle({}, None, None)
+    assert active and np.allclose(force, [2.0, 1.0])
 
 
 def test_active_waypoint_survives_failed_periodic_replan():
@@ -195,6 +224,7 @@ if __name__ == "__main__":
     test_colreg_four_zone_rules()
     test_only_dynamic_ellipse_fade()
     test_crossing_passes_astern()
+    test_repulsion_uses_the_locked_colreg_side()
     test_active_waypoint_survives_failed_periodic_replan()
     test_dynamic_replan_replaces_current_target()
     test_waypoint_path_never_targets_behind_robot()
