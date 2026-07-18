@@ -1,0 +1,7 @@
+{
+  "source": "webots_touch_sensor",
+  "obstacle_model": "ShipObstacle",
+  "sensor_available": true,
+  "detected": false,
+  "first_contact_time_s": null
+}
