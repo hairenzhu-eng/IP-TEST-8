@@ -136,7 +136,8 @@ def first_existing(row, names):
     return next((row[name] for name in names if name in row), None)
 
 
-def find_pseudo_aruco_csv(run_dir):
+def find_groundtruth_csv(run_dir):
+    """Webots own-ship groundtruth is stored in the historical pseudo_aruco file."""
     candidates = list(Path(run_dir).glob("log_*_pseudo_aruco.csv"))
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
@@ -344,6 +345,19 @@ def point_cloud(value):
     return cloud[np.isfinite(cloud).all(axis=1)]
 
 
+def break_path_jumps(path, max_step_m=0.5):
+    """Insert NaNs at implausible jumps so matplotlib cannot join path segments."""
+    path = np.asarray(path, dtype=float)
+    if path.ndim != 2 or path.shape[1] < 2:
+        return np.empty((0, 2), dtype=float)
+    path = path[:, :2].copy()
+    if len(path) < 2:
+        return path
+    jumps = np.linalg.norm(np.diff(path, axis=0), axis=1) > float(max_step_m)
+    path[1:][jumps] = np.nan
+    return path
+
+
 def positive(value, fallback):
     try:
         value = float(value)
@@ -402,11 +416,11 @@ def read_trajectory_samples_csv(log_path, north_columns, east_columns):
 
 
 def load_robot_trajectory(run_dir):
-    pseudo_aruco_path = find_pseudo_aruco_csv(run_dir)
-    if pseudo_aruco_path is not None:
+    groundtruth_path = find_groundtruth_csv(run_dir)
+    if groundtruth_path is not None:
         try:
             return read_trajectory_samples_csv(
-                pseudo_aruco_path,
+                groundtruth_path,
                 OWN_NORTH_COLUMNS,
                 OWN_EAST_COLUMNS,
             )
@@ -679,6 +693,24 @@ def obstacle_ellipse_geometry(obstacle, settings):
     return centre, pc1_m, pc2_m, angle_deg
 
 
+def track_length_axis(track, payload):
+    axis = point(track.get("length_axis_ne"))
+    if axis is not None:
+        return normalized_axis(axis)
+    track_id = track.get("id")
+    for cluster in payload.get("clusters", []):
+        if not isinstance(cluster, dict) or cluster.get("track_id") != track_id:
+            continue
+        axis = point(cluster.get("length_axis_ne"))
+        if axis is not None:
+            return normalized_axis(axis)
+    axis = velocity_vector(track)
+    if axis is not None and float(np.linalg.norm(axis)) > 1e-9:
+        return normalized_axis(axis)
+    heading = parse_float(track.get("heading_rad"))
+    return np.array([np.cos(heading), np.sin(heading)], dtype=float) if np.isfinite(heading) else np.array([1.0, 0.0])
+
+
 def attractive_potential(north_grid, east_grid, target_ne, k_goal):
     target_ne = point(target_ne)
     if target_ne is None:
@@ -825,40 +857,54 @@ def potential_components(
         target_ne,
         k_goal,
     )
-    real = np.zeros_like(north_grid)
-    virtual = np.zeros_like(north_grid)
-
-    for obstacle in payload.get("clusters", []):
-        if isinstance(obstacle, dict):
-            real += ellipse_potential(
-                north_grid,
-                east_grid,
-                obstacle,
-                settings,
-                k_obstacle,
-            )
-
-    for obstacle in payload.get("virtual_obstacles", []):
-        if not isinstance(obstacle, dict):
+    current = np.zeros_like(north_grid)
+    dcpa = np.zeros_like(north_grid)
+    tracks = [item for item in payload.get("tracks", []) if isinstance(item, dict)]
+    virtuals = [item for item in payload.get("virtual_obstacles", []) if isinstance(item, dict)]
+    for track in tracks:
+        position_ne = point(track.get("position_ne"))
+        if position_ne is None:
             continue
-        if "segment_start_ne" in obstacle and "segment_end_ne" in obstacle:
-            virtual += segment_potential(
-                north_grid,
-                east_grid,
-                obstacle,
-                settings,
-                k_obstacle,
+        current_obstacle = dict(
+            track,
+            centre_ne=position_ne,
+            length_axis_ne=track_length_axis(track, payload),
+        )
+        current += ellipse_potential(north_grid, east_grid, current_obstacle, settings, k_obstacle)
+        track_id = track.get("id")
+        for virtual in virtuals:
+            if track_id is not None and virtual.get("label") not in {-1000 - int(track_id), track_id}:
+                continue
+            dcpa_ne = point(virtual.get("collision_position_ne"))
+            if dcpa_ne is None:
+                continue
+            dcpa += ellipse_potential(
+                north_grid, east_grid, dict(current_obstacle, centre_ne=dcpa_ne), settings, k_obstacle
             )
-        else:
-            virtual += ellipse_potential(
-                north_grid,
-                east_grid,
-                obstacle,
-                settings,
-                k_obstacle,
-            )
+            break
+    return attractive, current, dcpa, target_ne
 
-    return attractive, real, virtual, target_ne
+
+def webots_truth_path(payload):
+    values = [point(item.get("position_ne")) for item in payload.get("webots_obstacle_truth", []) if isinstance(item, dict)]
+    values = [value for value in values if value is not None]
+    return np.asarray(values, dtype=float) if values else np.empty((0, 2), dtype=float)
+
+
+def colreg_snapshot_label(payload):
+    apf = payload.get("apf", {})
+    value = apf.get("colreg_rule") if isinstance(apf, dict) else None
+    value = re.sub(r"[^a-z0-9_-]+", "_", str(value or "none").lower()).strip("_")
+    return value or "none"
+
+
+def run_colreg_label(snapshots):
+    labels = [colreg_snapshot_label(item["payload"]) for item in snapshots]
+    detected = [label for label in labels if label != "none"]
+    if not detected:
+        return "none"
+    counts = {label: detected.count(label) for label in set(detected)}
+    return max(counts, key=lambda label: (counts[label], label))
 
 
 def all_run_points(snapshots):
@@ -1040,7 +1086,6 @@ def plot_snapshot(
     run_collision_outcome,
 ):
     payload = snapshot["payload"]
-    webots_targets = simulate_webots_targets(payload, snapshot["time_s"])
     potential_payload = payload
     north_min, north_max, east_min, east_max = bounds
     north_axis = np.linspace(north_min, north_max, grid_size)
@@ -1048,8 +1093,8 @@ def plot_snapshot(
     east_grid, north_grid = np.meshgrid(east_axis, north_axis)
     (
         attractive_potential_map,
-        real_potential,
-        virtual_potential,
+        current_potential,
+        dcpa_potential,
         target_ne,
     ) = potential_components(
         north_grid,
@@ -1059,7 +1104,7 @@ def plot_snapshot(
         k_goal,
         k_obstacle,
     )
-    total_potential = attractive_potential_map + real_potential + virtual_potential
+    total_potential = attractive_potential_map + current_potential + dcpa_potential
 
     fig, ax = plt.subplots(figsize=(10, 8), dpi=160)
     minimum = float(np.min(total_potential))
@@ -1080,48 +1125,15 @@ def plot_snapshot(
 
     settings = payload.get("apf_settings", {})
     settings = settings if isinstance(settings, dict) else {}
-    prediction_horizon_s = positive(
-        settings.get("obstacle_prediction_horizon_s"),
-        30.0,
-    )
     domain_level = float(k_obstacle) / np.e
-    for obstacle in potential_payload.get("clusters", []):
-        if not isinstance(obstacle, dict):
-            continue
-        field = ellipse_potential(
-            north_grid,
-            east_grid,
-            obstacle,
-            settings,
-            k_obstacle,
-        )
+    for field, color, linestyle in (
+        (current_potential, "black", "-"),
+        (dcpa_potential, "#ff7f0e", "--"),
+    ):
         if float(np.min(field)) <= domain_level <= float(np.max(field)):
             ax.contour(
-                east_grid,
-                north_grid,
-                field,
-                levels=[domain_level],
-                colors="black",
-                linewidths=1.1,
-            )
-
-    for obstacle in potential_payload.get("virtual_obstacles", []):
-        if not isinstance(obstacle, dict):
-            continue
-        field = (
-            segment_potential(north_grid, east_grid, obstacle, settings, k_obstacle)
-            if "segment_start_ne" in obstacle and "segment_end_ne" in obstacle
-            else ellipse_potential(north_grid, east_grid, obstacle, settings, k_obstacle)
-        )
-        if float(np.min(field)) <= domain_level <= float(np.max(field)):
-            ax.contour(
-                east_grid,
-                north_grid,
-                field,
-                levels=[domain_level],
-                colors="#ff7f0e",
-                linestyles="--",
-                linewidths=1.1,
+                east_grid, north_grid, field, levels=[domain_level],
+                colors=color, linestyles=linestyle, linewidths=1.1,
             )
 
     gradient_north, gradient_east = np.gradient(
@@ -1153,7 +1165,7 @@ def plot_snapshot(
         zorder=3,
     )
 
-    history = np.asarray(robot_history, dtype=float)
+    history = break_path_jumps(robot_history)
     ax.plot(
         history[:, 1],
         history[:, 0],
@@ -1198,11 +1210,8 @@ def plot_snapshot(
             zorder=9,
         )
 
-    clusters = [
-        obstacle
-        for obstacle in payload.get("clusters", [])
-        if isinstance(obstacle, dict) and point(obstacle.get("centre_ne")) is not None
-    ]
+    # Snapshot positions come from EKF tracks; raw LiDAR cluster centres are not plotted.
+    clusters = []
     if clusters:
         centres = np.asarray(
             [point(obstacle.get("centre_ne")) for obstacle in clusters],
@@ -1370,6 +1379,55 @@ def plot_snapshot(
         if not isinstance(track, dict):
             continue
         position = point(track.get("position_ne"))
+        if position is None:
+            continue
+        ax.scatter(
+            [position[1]], [position[0]], marker="o", s=65,
+            facecolors="#2ca02c", edgecolors="black", linewidth=0.7,
+            label="Obstacle EKF position" if track_index == 0 else None,
+            zorder=8,
+        )
+        for virtual in payload.get("virtual_obstacles", []):
+            if not isinstance(virtual, dict):
+                continue
+            dcpa_position = point(virtual.get("collision_position_ne"))
+            if dcpa_position is None:
+                continue
+            ax.scatter(
+                [dcpa_position[1]], [dcpa_position[0]], marker="X", s=90,
+                color="#ff7f0e", edgecolor="black", linewidth=0.7,
+                label="DCPA position" if track_index == 0 else None,
+                zorder=9,
+            )
+            break
+        pc1_m, pc2_m = obstacle_dimensions(dict(track, centre_ne=position), settings)
+        axis_ne = track_length_axis(track, payload)
+        ax.add_patch(Ellipse(
+            xy=(position[1], position[0]), width=pc1_m, height=pc2_m,
+            angle=float(np.degrees(np.arctan2(axis_ne[0], axis_ne[1]))),
+            facecolor="#2ca02c", edgecolor="white", linewidth=1.2,
+            alpha=0.30, label="EKF obstacle size" if track_index == 0 else None,
+            zorder=7,
+        ))
+
+    truth_path = webots_truth_path(payload)
+    truth_plot = break_path_jumps(truth_path)
+    if len(truth_path) >= 2:
+        ax.plot(
+            truth_plot[:, 1], truth_plot[:, 0], color="#00c2c7",
+            linewidth=1.8, linestyle=":", label="Webots true obstacle path", zorder=6,
+        )
+        ax.scatter(
+            [truth_path[-1, 1]], [truth_path[-1, 0]], marker="D", s=60,
+            facecolors="#00c2c7", edgecolors="black", linewidth=0.6,
+            label="Webots true obstacle position", zorder=9,
+        )
+
+    # Deliberately empty: the 15 s EKF prediction path is not a snapshot output.
+    for track_index, track in enumerate([]):
+        if not isinstance(track, dict):
+            continue
+        position = point(track.get("position_ne"))
         if position is not None:
             ax.scatter(
                 [position[1]],
@@ -1439,12 +1497,12 @@ def plot_snapshot(
     ax.grid(True, alpha=0.25)
 
     handles, labels = ax.get_legend_handles_labels()
-    if float(np.max(real_potential)) > 1e-9:
+    if float(np.max(current_potential)) > 1e-9:
         handles.append(Line2D([0], [0], color="black", linewidth=1.0))
-        labels.append("Measured-obstacle potential boundary")
-    if float(np.max(virtual_potential)) > 1e-9:
+        labels.append("Current EKF potential boundary")
+    if float(np.max(dcpa_potential)) > 1e-9:
         handles.append(Line2D([0], [0], color="#ff7f0e", linestyle="--", linewidth=1.0))
-        labels.append("Predicted-obstacle potential boundary")
+        labels.append("DCPA potential boundary")
     if clusters:
         if has_webots_real_position:
             handles.append(
@@ -1482,7 +1540,7 @@ def plot_snapshot(
     ax.legend(
         unique.values(),
         unique.keys(),
-        loc="upper left",
+        loc="upper right",
         fontsize=8,
         framealpha=0.9,
     )
@@ -1518,6 +1576,7 @@ def generate_snapshots(
     bounds = run_bounds(snapshots, map_size_m)
     default_target_ne = point(snapshots[-1]["payload"].get("robot_pos"))
     trajectory_time_s, trajectory_ne_m = load_robot_trajectory(run_dir)
+    colreg_label = run_colreg_label(snapshots)
 
     outputs = []
     selected_targets = {
@@ -1542,7 +1601,7 @@ def generate_snapshots(
             if robot_position is None:
                 continue
             robot_history = np.asarray([robot_position], dtype=float)
-        output_path = output_dir / f"apf_snapshot_{target_time_s:06.1f}s.png"
+        output_path = output_dir / f"apf_snapshot_{colreg_label}_{target_time_s:06.1f}s.png"
         plot_snapshot(
             snapshot=snapshot,
             robot_history=robot_history,
@@ -1600,6 +1659,15 @@ def _self_check():
     assert world_output_dir(Path("x"), "mr_webots_head_on_small_ship.wbt").as_posix().endswith(
         "x/mr_webots_head_on_small_ship"
     )
+    assert colreg_snapshot_label({"apf": {"colreg_rule": "crossing/pass astern"}}) == "crossing_pass_astern"
+    assert run_colreg_label([
+        {"payload": {"apf": {"colreg_rule": "none"}}},
+        {"payload": {"apf": {"colreg_rule": "head_on"}}},
+        {"payload": {"apf": {"colreg_rule": "head_on"}}},
+    ]) == "head_on"
+    assert len(webots_truth_path({"webots_obstacle_truth": [{"position_ne": [1, 2]}]})) == 1
+    broken = break_path_jumps([[0.0, 0.0], [2.0, 0.0], [2.1, 0.0]])
+    assert np.isnan(broken[1]).all()
 
 
 def main():

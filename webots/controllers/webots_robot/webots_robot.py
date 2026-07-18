@@ -536,6 +536,9 @@ class WebotsController(Supervisor):
         self.groundtruth_pub = Publisher(
             "/groundtruth", geometry_msgs.PoseStamped
         )        
+        self.obstacle_groundtruth_pub = Publisher(
+            "/webots_obstacle_groundtruth", geometry_msgs.PoseStamped
+        )
         self.control_sub = Subscriber("/control", geometry_msgs.Vector3, self.control_callback)
         self.gyro_pub = Publisher(
             "/imu", geometry_msgs.Vector3
@@ -800,7 +803,11 @@ class WebotsController(Supervisor):
             if target is not None:
                 self.motion_targets.append(target)
         elif static_path_obstacle_node is not None:
-            print("Static path obstacle robot found; leaving it stationary.")
+            target = self._make_motion_target(
+                "STATIC_PATH_OBSTACLE_ROBOT", static_path_obstacle_node, speed=0.0
+            )
+            if target is not None:
+                self.motion_targets.append(target)
         else:
             print("Warning: no front obstacle robot found; skipping obstacle update.")
 
@@ -848,6 +855,7 @@ class WebotsController(Supervisor):
 
         self._shutdown_zeroros_endpoint(getattr(self, "control_sub", None))
         self._shutdown_zeroros_endpoint(getattr(self, "groundtruth_pub", None))
+        self._shutdown_zeroros_endpoint(getattr(self, "obstacle_groundtruth_pub", None))
         self._shutdown_zeroros_endpoint(getattr(self, "gyro_pub", None))
         self._shutdown_zeroros_endpoint(getattr(self, "sonar_pub", None))
         self._shutdown_zeroros_endpoint(getattr(self, "collision_pub", None))
@@ -959,6 +967,7 @@ class WebotsController(Supervisor):
         current_speed = 0.0 if start_with_zero_speed and acceleration > 0.0 else float(speed)
         return {
             "name": name,
+            "node": node,
             "translation_field": translation_field,
             "rotation_field": rotation_field,
             "position": position,
@@ -1145,6 +1154,7 @@ class WebotsController(Supervisor):
         self.dynamics_engine()
 
         current_time = datetime.now(UTC).timestamp()
+        self.publish_obstacle_groundtruth(current_time)
         collision_contact = self.collision_sensor.getValue() > 0.0
         if collision_contact and not self.collision_detected:
             self.collision_detected = True
@@ -1280,6 +1290,19 @@ class WebotsController(Supervisor):
         dt = self.timeStep / 1000.0
         for target in self.motion_targets:
             self._apply_motion_target(target, dt)
+
+    def publish_obstacle_groundtruth(self, timestamp):
+        if not self.motion_targets:
+            return
+        node = self.motion_targets[0]["node"]
+        position = node.getPosition()
+        msg = geometry_msgs.PoseStamped()
+        msg.header.stamp = timestamp
+        msg.pose.position.x = float(position[0])
+        msg.pose.position.y = float(position[1])
+        msg.pose.position.z = float(position[2])
+        msg.pose.orientation.from_euler(0, 0, self._node_yaw(node))
+        self.obstacle_groundtruth_pub.publish(msg)
 
 
 wc = WebotsController()

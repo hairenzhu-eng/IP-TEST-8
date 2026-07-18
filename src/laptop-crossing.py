@@ -3004,7 +3004,7 @@ class LaptopController:
         # log groundtruth if running webots simulation
         with self.groundtruth_log.open('a') as f:
             f.write(f"{t},{t-self.starttime},{n},{e},{d},{roll},{pitch},{yaw},{broadcast}\n")
-         
+
     def feedback_control(self, ds, ks = None, kn = None, kg = None):
 
         if ks == None: ks = 0.1

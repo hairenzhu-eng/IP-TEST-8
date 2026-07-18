@@ -272,6 +272,7 @@ class LaptopController:
         self.filename = self.run_dir / f"log_{filename_time}.csv"
         self.obstacle_log_dir = self.run_dir
         self.last_obstacle_snapshot_stamp_s = None
+        self.webots_obstacle_truth = []
         self.webots_collision_detected = False
         self.webots_collision_record_written = False
         
@@ -635,6 +636,12 @@ class LaptopController:
         self.aruco_driver = ArUcoUDPDriver(aruco_params, parent=self)        
         # a callback only used by WEBOTS to fake Aruco readings 
         self.groundtruth_sub = Subscriber("/groundtruth", PoseStamped, self.groundtruth_callback, ip=self.robot_ip) 
+        self.webots_obstacle_truth_sub = Subscriber(
+            "/webots_obstacle_groundtruth",
+            PoseStamped,
+            self.webots_obstacle_groundtruth_callback,
+            ip=self.robot_ip,
+        )
         self.pseudo_aruco_counter = 0
         
         ########### CONNECT TO ROBOT ###########
@@ -689,6 +696,7 @@ class LaptopController:
         self.lidar_sub.stop()
         if self.collision_sub is not None:
             self.collision_sub.stop()
+        self.webots_obstacle_truth_sub.stop()
         Console.info("Thrusters stopped")
         Console.info("Data saved in ",self.filename)
         self.r.sleep()
@@ -720,6 +728,20 @@ class LaptopController:
         }
         with (self.run_dir / "webots_collision.json").open("w") as stream:
             json.dump(payload, stream, indent=2)
+
+    def webots_obstacle_groundtruth_callback(self, msg: PoseStamped):
+        pose = msg.pose
+        try:
+            position_ne = [float(pose.position.x), -float(pose.position.y)]
+            q = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+            yaw_rad = float(R.from_quat(q).as_euler("xyz")[2])
+        except (TypeError, ValueError):
+            return
+        self.webots_obstacle_truth.append({
+            "t": float(self.timefromstart or 0.0),
+            "position_ne": position_ne,
+            "heading_rad": yaw_rad,
+        })
 
     def command_cb(self,msg: String):
         Console.info(f"Response from robot: {msg.data}")
@@ -1112,6 +1134,7 @@ class LaptopController:
             "cloud": self.lidar_data if self.lidar_data is not None else [],
             "clusters": self.lidar_obstacles,
             "tracks": self.obstacle_track_visuals(),
+            "webots_obstacle_truth": self.webots_obstacle_truth,
             "virtual_obstacles": self.apf_virtual_obstacles,
             "apf": {
                 "navigation_mode": self.navigation_mode,
