@@ -2375,8 +2375,9 @@ class LaptopController:
             )
 
         target_body = self.earth_point_to_body(target_ne)
+        goal_body = self.earth_point_to_body(self.goal_ne)
         path_force = np.zeros(2, dtype=float) if final_approach else self.apf_path_attraction_body()
-        attractive_force = self.apf_goal_attraction_body(target_body) + path_force
+        attractive_force = self.apf_goal_attraction_body(goal_body) + path_force
         force_body = attractive_force.copy()
         repulsive_force = np.zeros(2, dtype=float)
         own_vel_body = self.current_velocity_body()

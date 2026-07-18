@@ -1338,6 +1338,14 @@ class LaptopController:
                 "repulsive_force_body": self.apf_repulsive_force_body,
                 "attractive_force_body": self.apf_attractive_force_body,
                 "target_ne": self.apf_target_ne,
+                "goal_ne": self.goal_ne,
+                "path_start_ne": self.start_ne,
+                "path_end_ne": self.goal_ne,
+                "path_unit_ne": self.route_path_unit_ne,
+                "goal_gain": self.apf_goal_gain,
+                "path_gain": self.apf_path_gain,
+                "path_threshold_m": self.apf_path_threshold_m,
+                "attraction_saturation_m": self.apf_attraction_saturation_m,
             },
             "apf_settings": {
                 "own_equivalent_radius_m": self.apf_own_equivalent_radius_m,
@@ -2762,8 +2770,9 @@ class LaptopController:
             _, target_ne = self.route_progress_and_point(self.apf_route_lookahead_m)
 
         target_body = self.earth_point_to_body(target_ne)
+        goal_body = self.earth_point_to_body(self.goal_ne)
         path_force = np.zeros(2, dtype=float) if final_approach else self.apf_path_attraction_body()
-        attractive_force = self.apf_goal_attraction_body(target_body) + path_force
+        attractive_force = self.apf_goal_attraction_body(goal_body) + path_force
         force_body = attractive_force.copy()
         repulsive_force = np.zeros(2, dtype=float)
         own_vel_body = self.current_velocity_body()

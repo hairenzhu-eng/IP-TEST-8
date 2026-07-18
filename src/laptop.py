@@ -432,11 +432,6 @@ class LaptopController(_OvertakingController):
                 own_vel_body,
             )
             locked_side = self.apf_lock_side(requested_side, 1.0)
-            if locked_side != 0.0:
-                # Preserve the APF magnitude and forward/aft component while
-                # preventing its lateral direction from crossing the locked
-                # COLREG side (crossing: astern; head-on/overtaking: starboard).
-                force[1] = locked_side * abs(force[1])
             self.apf_encounter_mode = encounter
             self.apf_colreg_rule = action
             self.apf_avoidance_side_sign = locked_side
@@ -1461,6 +1456,8 @@ class LaptopController(_OvertakingController):
                 payload = json.load(f)
             payload["run_context"] = self._run_context()
             apf = payload.setdefault("apf", {})
+            apf["goal_ne"] = self.goal_ne
+            apf["path_end_ne"] = self.goal_ne
             apf["selected_controller"] = self.apf_selected_controller
             apf["colreg_active"] = self.apf_colreg_active
             apf["active_profile"] = self.apf_active_profile_name

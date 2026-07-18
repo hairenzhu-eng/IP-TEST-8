@@ -47,6 +47,14 @@ def test_repulsion_uses_the_locked_colreg_side():
         apf_last_dynamic_field_s=-np.inf,
         apf_overtaking_params={},
         apf_dynamic_speed_threshold_m_s=0.05,
+        apf_current_field_size_scale={
+            "head_on": 4.0, "overtaking": 4.0,
+            "crossing": 4.0, "static_obstacle": 4.0,
+        },
+        apf_predicted_field_size_scale={
+            "head_on": 7.0, "overtaking": 7.0,
+            "crossing": 7.0, "static_obstacle": 7.0,
+        },
     )
     controller._dynamic_ellipse_repulsion = lambda *_args: (np.array([2.0, 1.0]), True)
     controller._obstacle_body_position = lambda _obstacle: np.array([1.0, 0.0])
@@ -65,6 +73,24 @@ def test_repulsion_uses_the_locked_colreg_side():
     controller._obstacle_body_velocity = lambda _obstacle: np.array([0.0, -1.0])
     force, active, _ = controller.apf_repulsion_for_obstacle({}, None, None)
     assert active and np.allclose(force, [2.0, 1.0])
+
+
+def test_field_size_scales_are_independent_by_colreg_profile():
+    from laptop import LaptopController
+
+    controller = LaptopController.__new__(LaptopController)
+    controller.apf_current_field_size_scale = {
+        "head_on": 1.0, "overtaking": 2.0,
+        "crossing": 3.0, "static_obstacle": 4.0,
+    }
+    controller.apf_predicted_field_size_scale = {
+        "head_on": 5.0, "overtaking": 6.0,
+        "crossing": 7.0, "static_obstacle": 8.0,
+    }
+    assert controller.apf_field_size_scale({}, "head_on") == 1.0
+    assert controller.apf_field_size_scale({}, "crossing_from_starboard") == 3.0
+    assert controller.apf_field_size_scale({"virtual": True}, "being_overtaken") == 6.0
+    assert controller.apf_field_size_scale({"virtual": True}, "static_obstacle") == 8.0
 
 
 def test_active_waypoint_survives_failed_periodic_replan():

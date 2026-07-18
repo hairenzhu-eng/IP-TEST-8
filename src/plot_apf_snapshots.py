@@ -18,7 +18,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse
 import numpy as np
 
-from webots_collision import avoidance_succeeded, collision_outcome_text
+from webots_collision import collision_outcome_text
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -279,17 +279,6 @@ def has_snapshot_logs(run_dir):
     return any(Path(run_dir).glob("obstacle_*.json"))
 
 
-def is_standard_run_dir(run_dir):
-    if not has_snapshot_logs(run_dir) or avoidance_succeeded(run_dir) is not True:
-        return False
-    summary = _read_json(Path(run_dir) / "run_summary.json")
-    return not summary or (
-        summary.get("collision_detected") is False
-        and summary.get("mission_complete") is True
-        and summary.get("goal_reached") is True
-    )
-
-
 def load_latest_world_runs(logs_dir, combination="ekf_on_cluster_on"):
     latest_by_world = {}
     for matrix_dir in latest_matrix_dirs(logs_dir):
@@ -310,7 +299,7 @@ def load_latest_world_runs(logs_dir, combination="ekf_on_cluster_on"):
             if not world_name or not run_dir_text or world_name in latest_by_world:
                 continue
             run_dir = (PROJECT_ROOT / str(run_dir_text)).resolve()
-            if run_dir.is_dir() and is_standard_run_dir(run_dir):
+            if run_dir.is_dir() and has_snapshot_logs(run_dir):
                 latest_by_world[world_name] = RunSelection(
                     run_dir=run_dir,
                     world_name=world_name,
@@ -320,7 +309,7 @@ def load_latest_world_runs(logs_dir, combination="ekf_on_cluster_on"):
         return sorted(latest_by_world.values(), key=lambda item: Path(item.world_name).stem)
 
     for run_dir in list_resolved_run_dirs(logs_dir):
-        if not is_standard_run_dir(run_dir):
+        if not has_snapshot_logs(run_dir):
             continue
         try:
             selection = load_run_metadata_from_csv(run_dir)
@@ -593,29 +582,15 @@ def simulate_webots_target(target, elapsed_s, dt=0.05):
     return target
 
 
-def webots_motion_targets(payload):
+def simulate_webots_targets(payload, elapsed_s):
     run_context = payload.get("run_context", {})
     if not isinstance(run_context, dict):
         return []
     world_name = run_context.get("webots_environment")
     if not world_name:
         return []
-    return parse_world_motion_targets(world_name)
-
-
-def simulate_webots_targets(payload, elapsed_s):
-    return [
-        simulate_webots_target(target, elapsed_s)
-        for target in webots_motion_targets(payload)
-    ]
-
-
-def webots_target_trajectory_ne(target, elapsed_s, sample_count=80):
-    times = np.linspace(0.0, max(float(elapsed_s), 0.0), max(int(sample_count), 2))
-    return np.asarray(
-        [webots_position_to_ne(simulate_webots_target(target, time_s)) for time_s in times],
-        dtype=float,
-    )
+    targets = parse_world_motion_targets(world_name)
+    return [simulate_webots_target(target, elapsed_s) for target in targets]
 
 
 def webots_geometry_center_position(target):
@@ -837,7 +812,11 @@ def potential_components(
     settings = settings if isinstance(settings, dict) else {}
     apf = payload.get("apf", {})
     apf = apf if isinstance(apf, dict) else {}
-    target_ne = point(apf.get("target_ne"))
+    target_ne = point(apf.get("goal_ne"))
+    if target_ne is None:
+        target_ne = point(apf.get("path_end_ne"))
+    if target_ne is None:
+        target_ne = point(apf.get("target_ne"))
     if target_ne is None:
         target_ne = point(default_target_ne)
     attractive = attractive_potential(
@@ -908,8 +887,6 @@ def all_run_points(snapshots):
                 candidate = point(virtual.get(key))
                 if candidate is not None:
                     points.append(candidate)
-        for target in simulate_webots_targets(payload, snapshot["time_s"]):
-            points.append(webots_position_to_ne(target))
     return np.asarray(points, dtype=float)
 
 
@@ -1063,11 +1040,7 @@ def plot_snapshot(
     run_collision_outcome,
 ):
     payload = snapshot["payload"]
-    webots_source_targets = webots_motion_targets(payload)
-    webots_targets = [
-        simulate_webots_target(target, snapshot["time_s"])
-        for target in webots_source_targets
-    ]
+    webots_targets = simulate_webots_targets(payload, snapshot["time_s"])
     potential_payload = payload
     north_min, north_max, east_min, east_max = bounds
     north_axis = np.linspace(north_min, north_max, grid_size)
@@ -1225,35 +1198,6 @@ def plot_snapshot(
             zorder=9,
         )
 
-    for target_index, (source_target, webots_target) in enumerate(
-        zip(webots_source_targets, webots_targets)
-    ):
-        webots_trajectory = webots_target_trajectory_ne(
-            source_target,
-            snapshot["time_s"],
-        )
-        if len(webots_trajectory) >= 2:
-            ax.plot(
-                webots_trajectory[:, 1],
-                webots_trajectory[:, 0],
-                color="#00c2c7",
-                linewidth=2.0,
-                label="Webots true obstacle trajectory" if target_index == 0 else None,
-                zorder=7,
-            )
-        webots_position_ne = webots_position_to_ne(webots_target)
-        ax.scatter(
-            [webots_position_ne[1]],
-            [webots_position_ne[0]],
-            marker="D",
-            s=60,
-            facecolors="#00c2c7",
-            edgecolors="black",
-            linewidth=0.6,
-            label="Webots true obstacle current position" if target_index == 0 else None,
-            zorder=9,
-        )
-
     clusters = [
         obstacle
         for obstacle in payload.get("clusters", [])
@@ -1280,6 +1224,8 @@ def plot_snapshot(
             for track in payload.get("tracks", [])
             if isinstance(track, dict)
         ]
+        has_webots_real_position = False
+        has_webots_real_direction = False
         for cluster_index, obstacle in enumerate(clusters):
             geometry = obstacle_ellipse_geometry(obstacle, settings)
             if geometry is None:
@@ -1363,6 +1309,42 @@ def plot_snapshot(
                 },
                 zorder=10,
             )
+            if webots_position_ne is not None:
+                has_webots_real_position = True
+                ax.scatter(
+                    [webots_position_ne[1]],
+                    [webots_position_ne[0]],
+                    marker="D",
+                    s=60,
+                    facecolors="#00c2c7",
+                    edgecolors="black",
+                    linewidth=0.6,
+                    label="Webots true obstacle position" if cluster_index == 0 else None,
+                    zorder=9,
+                )
+            if real_heading_vector is not None and webots_position_ne is not None:
+                has_webots_real_direction = True
+                real_heading_norm = float(np.linalg.norm(real_heading_vector))
+                scaled_heading = real_heading_vector / real_heading_norm
+                real_arrow_length_m = np.clip(
+                    real_speed * 4.0 if np.isfinite(real_speed) else 1.0,
+                    0.8,
+                    1.8,
+                )
+                real_arrow_end_ne = (
+                    webots_position_ne + scaled_heading * real_arrow_length_m
+                )
+                ax.annotate(
+                    "",
+                    xy=(real_arrow_end_ne[1], real_arrow_end_ne[0]),
+                    xytext=(webots_position_ne[1], webots_position_ne[0]),
+                    arrowprops={
+                        "arrowstyle": "->",
+                        "color": "#00c2c7",
+                        "linewidth": 1.8,
+                    },
+                    zorder=9,
+                )
             if planned_direction is not None:
                 norm = float(np.linalg.norm(planned_direction))
                 scaled_direction = planned_direction / norm
@@ -1464,6 +1446,22 @@ def plot_snapshot(
         handles.append(Line2D([0], [0], color="#ff7f0e", linestyle="--", linewidth=1.0))
         labels.append("Predicted-obstacle potential boundary")
     if clusters:
+        if has_webots_real_position:
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="D",
+                    linestyle="none",
+                    markerfacecolor="#00c2c7",
+                    markeredgecolor="black",
+                    markersize=7,
+                )
+            )
+            labels.append("Webots true obstacle position")
+        if has_webots_real_direction:
+            handles.append(Line2D([0], [0], color="#00c2c7", linewidth=1.8))
+            labels.append("Webots true obstacle heading")
         handles.append(Line2D([0], [0], color="#ff8c00", linewidth=1.8))
         labels.append("Obstacle planned direction")
     handles.append(
@@ -1583,7 +1581,6 @@ def generate_latest_world_snapshots(
 
     generated = {}
     for selection in selections:
-        print(f"{selection.world_name}: {selection.run_dir}")
         generated[selection.world_name] = generate_snapshots(
             run_dir=selection.run_dir,
             output_dir=world_output_dir(output_dir, selection.world_name),
