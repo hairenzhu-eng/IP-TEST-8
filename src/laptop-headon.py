@@ -16,6 +16,8 @@ import subprocess
 import platform
 import copy
 
+from colreg_apf import constrain_velocity_to_axis, smooth_undirected_axis, straight_line_cpa
+
 from zeroros import Publisher, Subscriber
 from zeroros.messages import String, Vector3, Vector3Stamped, Pose, PoseStamped, RBLaserScan
 from zeroros.datalogger import DataLogger
@@ -405,6 +407,9 @@ class LaptopController:
         self.obstacle_ekf_initial_position_std_m = 0.20
         self.obstacle_ekf_initial_velocity_std_m_s = 0.35
         self.obstacle_heading_hold_speed_m_s = 0.03
+        self.obstacle_axis_smoothing_alpha = 0.20
+        self.obstacle_axis_min_aspect_ratio = 1.4
+        self.obstacle_axis_max_velocity_gap_rad = np.deg2rad(30.0)
         self.obstacle_prediction_horizon_s = 15.0
         self.obstacle_prediction_step_s = 0.5
         self.obstacle_history_len = 60
@@ -1364,6 +1369,12 @@ class LaptopController:
             if np.isfinite(length_axis_ne).all() and axis_norm >= 1e-6
             else np.array([1.0, 0.0], dtype=float)
         )
+        if bool(track.get("motion_stable", False)) and track["pc1_m"] >= self.obstacle_axis_min_aspect_ratio * track["pc2_m"]:
+            state[2:4] = constrain_velocity_to_axis(
+                state[2:4], track["length_axis_ne"], self.obstacle_axis_max_velocity_gap_rad
+            )
+            track["state"] = state
+            track["vel_ne"] = state[2:4].copy()
 
         ekf_velocity_ne = track["vel_ne"].copy()
         speed_m_s = float(np.linalg.norm(ekf_velocity_ne))
@@ -1519,7 +1530,9 @@ class LaptopController:
                 previous_axis = np.asarray(track.get("length_axis_ne", length_axis_ne), dtype=float).reshape(2)
                 if float(np.dot(length_axis_ne, previous_axis)) < 0.0:
                     length_axis_ne = -length_axis_ne
-                track["length_axis_ne"] = length_axis_ne
+                track["length_axis_ne"] = smooth_undirected_axis(
+                    previous_axis, length_axis_ne, self.obstacle_axis_smoothing_alpha
+                )
 
         history = track.setdefault("history_ne", [])
         history.append(pos_ne)
@@ -2068,17 +2081,10 @@ class LaptopController:
     def apf_cpa_metrics(self, obs_pos_body, obs_vel_body, own_vel_body):
         if not self.obstacle_ekf_prediction_enabled:
             return np.nan, np.nan
-
-        rel_vel = np.asarray(obs_vel_body, dtype=float).reshape(2) - np.asarray(own_vel_body, dtype=float).reshape(2)
-        obs_pos_body = np.asarray(obs_pos_body, dtype=float).reshape(2)
-        rel_speed_sq = float(np.dot(rel_vel, rel_vel))
-
-        if rel_speed_sq < 1e-9:
-            return np.inf, float(np.linalg.norm(obs_pos_body))
-
-        tcpa = max(-float(np.dot(obs_pos_body, rel_vel)) / rel_speed_sq, 0.0)
-        dcpa = float(np.linalg.norm(obs_pos_body + rel_vel * tcpa))
-        return tcpa, dcpa
+        tcpa_s, dcpa_m, _, _ = straight_line_cpa(
+            [0.0, 0.0], own_vel_body, obs_pos_body, obs_vel_body
+        )
+        return tcpa_s, dcpa_m
 
     def apf_pass_astern_side_from_velocity(self, obs_vel_body):
         obs_vel_body = np.asarray(obs_vel_body, dtype=float).reshape(2)

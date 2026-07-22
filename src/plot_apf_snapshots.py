@@ -416,17 +416,6 @@ def read_trajectory_samples_csv(log_path, north_columns, east_columns):
 
 
 def load_robot_trajectory(run_dir):
-    groundtruth_path = find_groundtruth_csv(run_dir)
-    if groundtruth_path is not None:
-        try:
-            return read_trajectory_samples_csv(
-                groundtruth_path,
-                OWN_NORTH_COLUMNS,
-                OWN_EAST_COLUMNS,
-            )
-        except ValueError:
-            pass
-
     log_path = find_primary_csv(run_dir)
     try:
         return read_trajectory_samples_csv(
@@ -435,11 +424,17 @@ def load_robot_trajectory(run_dir):
             ARUCO_EAST_COLUMNS,
         )
     except ValueError:
-        return read_trajectory_samples_csv(
-            log_path,
-            OWN_NORTH_COLUMNS,
-            OWN_EAST_COLUMNS,
-        )
+        groundtruth_path = find_groundtruth_csv(run_dir)
+        if groundtruth_path is not None:
+            try:
+                return read_trajectory_samples_csv(
+                    groundtruth_path,
+                    OWN_NORTH_COLUMNS,
+                    OWN_EAST_COLUMNS,
+                )
+            except ValueError:
+                pass
+        return read_trajectory_samples_csv(log_path, OWN_NORTH_COLUMNS, OWN_EAST_COLUMNS)
 
 
 def wrap_to_pi(angle_rad):
@@ -694,6 +689,13 @@ def obstacle_ellipse_geometry(obstacle, settings):
 
 
 def track_length_axis(track, payload):
+    for key in ("apf_ellipse_axis_ne", "lidar_motion_axis_ne"):
+        axis = point(track.get(key))
+        if axis is not None and float(np.linalg.norm(axis)) > 1e-9:
+            return normalized_axis(axis)
+    velocity = velocity_vector(track)
+    if velocity is not None and float(np.linalg.norm(velocity)) > 1e-9:
+        return normalized_axis(velocity)
     axis = point(track.get("length_axis_ne"))
     if axis is not None:
         return normalized_axis(axis)
@@ -704,9 +706,6 @@ def track_length_axis(track, payload):
         axis = point(cluster.get("length_axis_ne"))
         if axis is not None:
             return normalized_axis(axis)
-    axis = velocity_vector(track)
-    if axis is not None and float(np.linalg.norm(axis)) > 1e-9:
-        return normalized_axis(axis)
     heading = parse_float(track.get("heading_rad"))
     return np.array([np.cos(heading), np.sin(heading)], dtype=float) if np.isfinite(heading) else np.array([1.0, 0.0])
 
@@ -860,7 +859,10 @@ def potential_components(
     current = np.zeros_like(north_grid)
     dcpa = np.zeros_like(north_grid)
     tracks = [item for item in payload.get("tracks", []) if isinstance(item, dict)]
-    virtuals = [item for item in payload.get("virtual_obstacles", []) if isinstance(item, dict)]
+    virtuals = [
+        item for item in payload.get("virtual_obstacles", [])
+        if isinstance(item, dict) and bool(item.get("predicted_risk_active", False))
+    ]
     for track in tracks:
         position_ne = point(track.get("position_ne"))
         if position_ne is None:
@@ -875,11 +877,18 @@ def potential_components(
         for virtual in virtuals:
             if track_id is not None and virtual.get("label") not in {-1000 - int(track_id), track_id}:
                 continue
-            dcpa_ne = point(virtual.get("collision_position_ne"))
+            dcpa_ne = point(virtual.get("centre_ne"))
             if dcpa_ne is None:
                 continue
+            dcpa_axis_ne = normalized_axis(
+                virtual.get("apf_ellipse_axis_ne", current_obstacle["length_axis_ne"])
+            )
             dcpa += ellipse_potential(
-                north_grid, east_grid, dict(current_obstacle, centre_ne=dcpa_ne), settings, k_obstacle
+                north_grid,
+                east_grid,
+                dict(current_obstacle, centre_ne=dcpa_ne, length_axis_ne=dcpa_axis_ne),
+                settings,
+                k_obstacle,
             )
             break
     return attractive, current, dcpa, target_ne
@@ -889,6 +898,11 @@ def webots_truth_path(payload):
     values = [point(item.get("position_ne")) for item in payload.get("webots_obstacle_truth", []) if isinstance(item, dict)]
     values = [value for value in values if value is not None]
     return np.asarray(values, dtype=float) if values else np.empty((0, 2), dtype=float)
+
+
+def webots_truth_run_path(snapshots):
+    values = [webots_truth_path(snapshot["payload"]) for snapshot in snapshots]
+    return np.asarray([path[-1] for path in values if len(path)], dtype=float)
 
 
 def colreg_snapshot_label(payload):
@@ -917,6 +931,7 @@ def all_run_points(snapshots):
         cloud = point_cloud(payload.get("cloud", []))
         if len(cloud):
             points.extend(cloud)
+        points.extend(webots_truth_path(payload))
         for collection_name in ("clusters", "tracks"):
             for item in payload.get(collection_name, []):
                 if not isinstance(item, dict):
@@ -927,7 +942,7 @@ def all_run_points(snapshots):
                 if candidate is not None:
                     points.append(candidate)
         for virtual in payload.get("virtual_obstacles", []):
-            if not isinstance(virtual, dict):
+            if not isinstance(virtual, dict) or not bool(virtual.get("predicted_risk_active", False)):
                 continue
             for key in ("segment_start_ne", "segment_end_ne", "centre_ne"):
                 candidate = point(virtual.get(key))
@@ -1071,10 +1086,11 @@ def plan_direction_vector(track, prediction):
     return None
 
 
-def plot_snapshot(
+def _plot_snapshot_legacy(
     snapshot,
     robot_history,
     robot_position,
+    webots_run_path,
     bounds,
     output_path,
     grid_size,
@@ -1388,17 +1404,48 @@ def plot_snapshot(
             zorder=8,
         )
         for virtual in payload.get("virtual_obstacles", []):
-            if not isinstance(virtual, dict):
+            if not isinstance(virtual, dict) or not bool(virtual.get("predicted_risk_active", False)):
                 continue
-            dcpa_position = point(virtual.get("collision_position_ne"))
+            if virtual.get("label") not in {-1000 - int(track.get("id", 0)), track.get("id")}:
+                continue
+            dcpa_position = point(virtual.get("centre_ne"))
             if dcpa_position is None:
                 continue
             ax.scatter(
                 [dcpa_position[1]], [dcpa_position[0]], marker="X", s=90,
                 color="#ff7f0e", edgecolor="black", linewidth=0.7,
-                label="DCPA position" if track_index == 0 else None,
+                label="Obstacle DCPA position" if track_index == 0 else None,
                 zorder=9,
             )
+            ax.plot(
+                [position[1], dcpa_position[1]],
+                [position[0], dcpa_position[0]],
+                color="#ff7f0e",
+                linestyle="--",
+                linewidth=1.8,
+                label="Obstacle straight EKF prediction" if track_index == 0 else None,
+                zorder=7,
+            )
+            own_cpa_position = point(virtual.get("collision_position_ne"))
+            if own_cpa_position is not None:
+                ax.plot(
+                    [robot_position[1], own_cpa_position[1]],
+                    [robot_position[0], own_cpa_position[0]],
+                    color="#1f77b4",
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="OS straight prediction" if track_index == 0 else None,
+                    zorder=7,
+                )
+                ax.plot(
+                    [own_cpa_position[1], dcpa_position[1]],
+                    [own_cpa_position[0], dcpa_position[0]],
+                    color="#ff7f0e",
+                    linestyle=":",
+                    linewidth=1.2,
+                    label="DCPA separation" if track_index == 0 else None,
+                    zorder=8,
+                )
             break
         pc1_m, pc2_m = obstacle_dimensions(dict(track, centre_ne=position), settings)
         axis_ne = track_length_axis(track, payload)
@@ -1411,71 +1458,18 @@ def plot_snapshot(
         ))
 
     truth_path = webots_truth_path(payload)
-    truth_plot = break_path_jumps(truth_path)
-    if len(truth_path) >= 2:
+    truth_plot = break_path_jumps(webots_run_path)
+    if len(webots_run_path) >= 2:
         ax.plot(
             truth_plot[:, 1], truth_plot[:, 0], color="#00c2c7",
-            linewidth=1.8, linestyle=":", label="Webots true obstacle path", zorder=6,
+            linewidth=2.4, linestyle=":", label="Webots true obstacle path", zorder=6,
         )
+    if len(truth_path):
         ax.scatter(
             [truth_path[-1, 1]], [truth_path[-1, 0]], marker="D", s=60,
             facecolors="#00c2c7", edgecolors="black", linewidth=0.6,
             label="Webots true obstacle position", zorder=9,
         )
-
-    # Deliberately empty: the 15 s EKF prediction path is not a snapshot output.
-    for track_index, track in enumerate([]):
-        if not isinstance(track, dict):
-            continue
-        position = point(track.get("position_ne"))
-        if position is not None:
-            ax.scatter(
-                [position[1]],
-                [position[0]],
-                marker="o",
-                s=55,
-                facecolors="none",
-                edgecolors="#2ca02c",
-                linewidth=1.4,
-                label="Obstacle EKF position" if track_index == 0 else None,
-                zorder=8,
-            )
-        prediction = straight_line_display_prediction(
-            track,
-            prediction_points(track),
-            prediction_horizon_s,
-        )
-        if len(prediction) >= 2:
-            ax.plot(
-                prediction[:, 1],
-                prediction[:, 0],
-                color="#ff7f0e",
-                linestyle="--",
-                linewidth=2.0,
-                marker=".",
-                markersize=4,
-                label=(
-                    f"EKF predicted trajectory ({prediction_horizon_s:g} s)"
-                    if track_index == 0
-                    else None
-                ),
-                zorder=7,
-            )
-            ax.scatter(
-                [prediction[-1, 1]],
-                [prediction[-1, 0]],
-                marker="X",
-                s=65,
-                color="#ff7f0e",
-                edgecolor="black",
-                linewidth=0.6,
-                label=(
-                    f"Obstacle position at +{prediction_horizon_s:g} s"
-                    if track_index == 0
-                    else None
-                ),
-                zorder=8,
-            )
 
     apf = payload.get("apf", {})
     mode = apf.get("navigation_mode", "unknown") if isinstance(apf, dict) else "unknown"
@@ -1551,6 +1545,9 @@ def plot_snapshot(
     plt.close(fig)
 
 
+plot_snapshot = _plot_snapshot_legacy
+
+
 def generate_snapshots(
     run_dir,
     output_dir=None,
@@ -1563,20 +1560,23 @@ def generate_snapshots(
 ):
     run_dir = Path(run_dir)
     snapshots = load_snapshots(run_dir)
+    robot_times_s, robot_trajectory_ne = load_robot_trajectory(run_dir)
     run_collision_outcome = collision_outcome_text(run_dir)
     selected_indices = select_snapshot_indices(snapshots, interval_s)
+    colreg_label = run_colreg_label(snapshots)
     output_dir = (
         Path(output_dir)
         if output_dir is not None
         else DEFAULT_OUTPUT_DIR / f"{run_dir.name}_apf_snapshots"
     )
+    if output_dir.name.lower() in {"webots_unknown", "unknown_webots"}:
+        output_dir = output_dir.parent / colreg_label
     output_dir.mkdir(parents=True, exist_ok=True)
     for old_snapshot in output_dir.glob("apf_snapshot_*.png"):
         old_snapshot.unlink()
     bounds = run_bounds(snapshots, map_size_m)
+    webots_run_path = webots_truth_run_path(snapshots)
     default_target_ne = point(snapshots[-1]["payload"].get("robot_pos"))
-    trajectory_time_s, trajectory_ne_m = load_robot_trajectory(run_dir)
-    colreg_label = run_colreg_label(snapshots)
 
     outputs = []
     selected_targets = {
@@ -1587,25 +1587,16 @@ def generate_snapshots(
         if index not in selected_targets:
             continue
         target_time_s = selected_targets[index]
-        sample_time_s = float(snapshot["time_s"])
-        history_mask = trajectory_time_s <= sample_time_s
-        if np.count_nonzero(history_mask) >= 2:
-            robot_history = trajectory_ne_m[history_mask]
-            robot_position = robot_history[-1]
-        elif len(trajectory_ne_m):
-            nearest_index = int(np.argmin(np.abs(trajectory_time_s - sample_time_s)))
-            robot_position = trajectory_ne_m[nearest_index]
-            robot_history = trajectory_ne_m[: nearest_index + 1]
-        else:
-            robot_position = point(snapshot["payload"].get("robot_pos"))
-            if robot_position is None:
-                continue
-            robot_history = np.asarray([robot_position], dtype=float)
+        snapshot_time_s = parse_float(snapshot["payload"].get("t"))
+        history_end = np.searchsorted(robot_times_s, snapshot_time_s, side="right")
+        robot_history = robot_trajectory_ne[:max(history_end, 1)]
+        robot_position = robot_history[-1]
         output_path = output_dir / f"apf_snapshot_{colreg_label}_{target_time_s:06.1f}s.png"
         plot_snapshot(
             snapshot=snapshot,
             robot_history=robot_history,
             robot_position=robot_position,
+            webots_run_path=webots_run_path,
             bounds=bounds,
             output_path=output_path,
             grid_size=max(int(grid_size), 80),
@@ -1640,9 +1631,11 @@ def generate_latest_world_snapshots(
 
     generated = {}
     for selection in selections:
+        colreg_name = run_colreg_label(load_snapshots(selection.run_dir))
+        print(f"Snapshot log: {selection.run_dir}")
         generated[selection.world_name] = generate_snapshots(
             run_dir=selection.run_dir,
-            output_dir=world_output_dir(output_dir, selection.world_name),
+            output_dir=world_output_dir(output_dir, colreg_name),
             interval_s=interval_s,
             grid_size=grid_size,
             k_goal=k_goal,
@@ -1666,8 +1659,16 @@ def _self_check():
         {"payload": {"apf": {"colreg_rule": "head_on"}}},
     ]) == "head_on"
     assert len(webots_truth_path({"webots_obstacle_truth": [{"position_ne": [1, 2]}]})) == 1
+    assert webots_truth_run_path([
+        {"payload": {"webots_obstacle_truth": [{"position_ne": [1, 2]}]}},
+        {"payload": {"webots_obstacle_truth": [{"position_ne": [3, 4]}]}},
+    ]).tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert [1.0, 2.0] in all_run_points([
+        {"payload": {"webots_obstacle_truth": [{"position_ne": [1, 2]}]}}
+    ]).tolist()
     broken = break_path_jumps([[0.0, 0.0], [2.0, 0.0], [2.1, 0.0]])
     assert np.isnan(broken[1]).all()
+    assert np.searchsorted([0.0, 1.0], 0.4, side="right") == 1
 
 
 def main():

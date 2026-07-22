@@ -15,7 +15,8 @@ from pathlib import Path
 import subprocess
 import platform
 import copy
-from dataclasses import dataclass
+
+from colreg_apf import constrain_velocity_to_axis, smooth_undirected_axis, straight_line_cpa
 
 from zeroros import Publisher, Subscriber
 from zeroros.messages import String, Vector3, Vector3Stamped, Pose, PoseStamped, RBLaserScan
@@ -83,309 +84,6 @@ def N2rpm(x, fwd_lim = 1.2753, rev_lim = -0.63765):
 # Keep heading errors continuous for route tracking.
 def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
-
-
-def heading_to_velocity_ne(speed_m_s, heading_rad):
-    speed_m_s = float(speed_m_s)
-    heading_rad = float(heading_rad)
-    return np.array(
-        [
-            speed_m_s * np.cos(heading_rad),
-            speed_m_s * np.sin(heading_rad),
-        ],
-        dtype=float,
-    )
-
-
-def velocity_ne_to_speed_heading(
-    velocity_ne,
-    fallback_heading_rad=0.0,
-    hold_speed_m_s=1e-3,
-):
-    velocity_ne = np.asarray(velocity_ne, dtype=float).reshape(2)
-    speed_m_s = float(np.linalg.norm(velocity_ne))
-    if speed_m_s < max(float(hold_speed_m_s), 0.0):
-        return speed_m_s, wrap_angle(float(fallback_heading_rad))
-    return speed_m_s, wrap_angle(float(np.arctan2(velocity_ne[1], velocity_ne[0])))
-
-
-@dataclass
-class ObstacleEkfConfig:
-    process_noise_px: float
-    process_noise_py: float
-    process_noise_v: float
-    process_noise_phi: float
-    process_noise_phi_dot: float
-    measurement_noise_px: float
-    measurement_noise_py: float
-    initial_position_std_m: float
-    initial_speed_std_m_s: float
-    initial_heading_std_rad: float
-    initial_turn_rate_std_rad_s: float
-    v_max_m_s: float
-    phi_dot_max_rad_s: float
-    heading_hold_speed_m_s: float
-    static_speed_reset_m_s: float
-    turn_rate_epsilon_rad_s: float
-    min_dt_s: float
-    max_dt_s: float
-
-
-class ObstacleEKF:
-    STATE_SIZE = 5
-
-    def __init__(self, state, covariance, config):
-        self.config = config
-        self.state = self.normalise_state(state, config.heading_hold_speed_m_s)
-        self.covariance = self.normalise_covariance(covariance)
-        self.last_predict_dt = 0.0
-        self.last_pre_predict_state = self.state.copy()
-        self._clamp_state()
-
-    @staticmethod
-    def normalise_state(state, hold_speed_m_s=1e-3):
-        state = np.asarray(state, dtype=float).reshape(-1)
-        if state.size == 5:
-            px, py, v, phi, phi_dot = state
-            return np.array(
-                [
-                    float(px),
-                    float(py),
-                    max(float(v), 0.0),
-                    wrap_angle(float(phi)),
-                    float(phi_dot),
-                ],
-                dtype=float,
-            )
-
-        if state.size == 4:
-            px, py, vx, vy = state
-            speed_m_s, heading_rad = velocity_ne_to_speed_heading(
-                [vx, vy],
-                fallback_heading_rad=0.0,
-                hold_speed_m_s=hold_speed_m_s,
-            )
-            return np.array(
-                [float(px), float(py), speed_m_s, heading_rad, 0.0],
-                dtype=float,
-            )
-
-        raise ValueError(f"Unsupported obstacle state size: {state.size}")
-
-    @staticmethod
-    def normalise_covariance(covariance):
-        covariance = np.asarray(covariance, dtype=float)
-        if covariance.shape == (5, 5):
-            return covariance.copy()
-        if covariance.shape == (4, 4):
-            expanded = np.zeros((5, 5), dtype=float)
-            expanded[0:2, 0:2] = covariance[0:2, 0:2]
-            expanded[2, 2] = max(float(covariance[2, 2]), float(covariance[3, 3]))
-            expanded[3, 3] = np.pi ** 2
-            expanded[4, 4] = 1.0
-            return expanded
-        if covariance.size == 0:
-            return np.eye(5, dtype=float)
-        raise ValueError(f"Unsupported obstacle covariance shape: {covariance.shape}")
-
-    @classmethod
-    def initial_covariance(cls, config):
-        return np.diag(
-            [
-                config.initial_position_std_m ** 2,
-                config.initial_position_std_m ** 2,
-                config.initial_speed_std_m_s ** 2,
-                config.initial_heading_std_rad ** 2,
-                config.initial_turn_rate_std_rad_s ** 2,
-            ]
-        )
-
-    def copy(self):
-        return ObstacleEKF(
-            self.state.copy(),
-            self.covariance.copy(),
-            self.config,
-        )
-
-    def velocity_ne(self):
-        return heading_to_velocity_ne(self.state[2], self.state[3])
-
-    def _clamp_state(self):
-        self.state[2] = float(np.clip(self.state[2], 0.0, self.config.v_max_m_s))
-        self.state[3] = wrap_angle(float(self.state[3]))
-        self.state[4] = float(
-            np.clip(
-                self.state[4],
-                -self.config.phi_dot_max_rad_s,
-                self.config.phi_dot_max_rad_s,
-            )
-        )
-        if self.state[2] < self.config.static_speed_reset_m_s:
-            self.state[2] = 0.0
-            self.state[4] = 0.0
-
-    def _ctrv_step(self, state, dt):
-        px, py, v, phi, phi_dot = self.normalise_state(
-            state,
-            self.config.heading_hold_speed_m_s,
-        )
-        dt = float(dt)
-        phi_dot = float(
-            np.clip(
-                phi_dot,
-                -self.config.phi_dot_max_rad_s,
-                self.config.phi_dot_max_rad_s,
-            )
-        )
-        v = float(np.clip(v, 0.0, self.config.v_max_m_s))
-
-        if abs(phi_dot) >= self.config.turn_rate_epsilon_rad_s:
-            next_phi = wrap_angle(phi + phi_dot * dt)
-            px_next = px + v / phi_dot * (np.sin(next_phi) - np.sin(phi))
-            py_next = py + v / phi_dot * (-np.cos(next_phi) + np.cos(phi))
-        else:
-            next_phi = phi if v < self.config.heading_hold_speed_m_s else wrap_angle(phi)
-            px_next = px + v * np.cos(phi) * dt
-            py_next = py + v * np.sin(phi) * dt
-
-        next_state = np.array(
-            [
-                px_next,
-                py_next,
-                v,
-                next_phi,
-                phi_dot,
-            ],
-            dtype=float,
-        )
-        if next_state[2] < self.config.static_speed_reset_m_s:
-            next_state[2] = 0.0
-            next_state[4] = 0.0
-        next_state[3] = wrap_angle(next_state[3])
-        return next_state
-
-    def _numerical_jacobian(self, state, dt):
-        state = np.asarray(state, dtype=float).reshape(5)
-        base = self._ctrv_step(state, dt)
-        jacobian = np.zeros((5, 5), dtype=float)
-        steps = np.array([1e-4, 1e-4, 1e-4, 1e-5, 1e-5], dtype=float)
-        for index, step in enumerate(steps):
-            perturbed = state.copy()
-            perturbed[index] += step
-            diff = self._ctrv_step(perturbed, dt) - base
-            if index == 3:
-                diff[3] = wrap_angle(diff[3])
-            jacobian[:, index] = diff / step
-        return jacobian
-
-    def process_noise(self, dt):
-        dt = max(float(dt), self.config.min_dt_s)
-        return np.diag(
-            [
-                (self.config.process_noise_px * dt) ** 2,
-                (self.config.process_noise_py * dt) ** 2,
-                (self.config.process_noise_v * np.sqrt(dt)) ** 2,
-                (self.config.process_noise_phi * np.sqrt(dt)) ** 2,
-                (self.config.process_noise_phi_dot * np.sqrt(dt)) ** 2,
-            ]
-        )
-
-    def measurement_noise(self):
-        return np.diag(
-            [
-                self.config.measurement_noise_px ** 2,
-                self.config.measurement_noise_py ** 2,
-            ]
-        )
-
-    def predict(self, dt):
-        dt = float(dt)
-        if not np.isfinite(dt) or dt < self.config.min_dt_s:
-            return self.get_state(), self.covariance.copy()
-        dt = min(dt, self.config.max_dt_s)
-        prior_state = self.state.copy()
-        self.last_pre_predict_state = prior_state.copy()
-        self.last_predict_dt = dt
-        self.state = self._ctrv_step(prior_state, dt)
-        F = self._numerical_jacobian(prior_state, dt)
-        self.covariance = F @ self.covariance @ F.T + self.process_noise(dt)
-        self.covariance = 0.5 * (self.covariance + self.covariance.T)
-        self._clamp_state()
-        return self.get_state(), self.covariance.copy()
-
-    def update(self, px_meas, py_meas, measurement_covariance=None):
-        z = np.array([float(px_meas), float(py_meas)], dtype=float)
-        H = np.array(
-            [
-                [1.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0, 0.0],
-            ],
-            dtype=float,
-        )
-        R = self.measurement_noise() if measurement_covariance is None else np.asarray(
-            measurement_covariance,
-            dtype=float,
-        ).reshape(2, 2)
-        innovation = z - H @ self.state
-        innovation_covariance = H @ self.covariance @ H.T + R
-        try:
-            innovation_inverse = np.linalg.inv(innovation_covariance)
-        except np.linalg.LinAlgError:
-            innovation_inverse = np.linalg.pinv(innovation_covariance)
-        kalman_gain = self.covariance @ H.T @ innovation_inverse
-        predicted_heading = float(self.state[3])
-        self.state = self.state + kalman_gain @ innovation
-        self.state[3] = predicted_heading if self.state[2] < self.config.heading_hold_speed_m_s else wrap_angle(float(self.state[3]))
-
-        # Bootstrap speed, heading, and turn rate from multi-frame position
-        # changes without overwriting the EKF state outright.
-        if self.last_predict_dt >= self.config.min_dt_s:
-            displacement_ne = z - self.last_pre_predict_state[0:2]
-            observed_velocity_ne = displacement_ne / self.last_predict_dt
-            observed_speed_m_s, observed_heading_rad = velocity_ne_to_speed_heading(
-                observed_velocity_ne,
-                fallback_heading_rad=predicted_heading,
-                hold_speed_m_s=self.config.heading_hold_speed_m_s,
-            )
-            if observed_speed_m_s >= self.config.heading_hold_speed_m_s:
-                speed_alpha = 0.55 if self.state[2] < self.config.heading_hold_speed_m_s else 0.25
-                heading_alpha = 0.60 if self.state[2] < self.config.heading_hold_speed_m_s else 0.25
-                self.state[2] = (1.0 - speed_alpha) * self.state[2] + speed_alpha * observed_speed_m_s
-                heading_error = wrap_angle(observed_heading_rad - self.state[3])
-                self.state[3] = wrap_angle(self.state[3] + heading_alpha * heading_error)
-                previous_speed = float(self.last_pre_predict_state[2])
-                if previous_speed >= self.config.heading_hold_speed_m_s:
-                    observed_phi_dot = wrap_angle(observed_heading_rad - self.last_pre_predict_state[3]) / self.last_predict_dt
-                    turn_alpha = 0.20
-                    self.state[4] = (1.0 - turn_alpha) * self.state[4] + turn_alpha * observed_phi_dot
-
-        identity = np.eye(self.STATE_SIZE, dtype=float)
-        correction = identity - kalman_gain @ H
-        self.covariance = correction @ self.covariance @ correction.T + kalman_gain @ R @ kalman_gain.T
-        self.covariance = 0.5 * (self.covariance + self.covariance.T)
-        self._clamp_state()
-        return self.get_state(), self.covariance.copy()
-
-    def get_predicted_position(self, t_horizon):
-        predicted_state = self._ctrv_step(self.state, max(float(t_horizon), 0.0))
-        return predicted_state[0:2].copy()
-
-    def get_predicted_trajectory(self, t_horizon, steps):
-        t_horizon = max(float(t_horizon), 0.0)
-        steps = max(int(steps), 1)
-        if t_horizon <= 0.0:
-            return np.asarray([self.state[0:2].copy()], dtype=float)
-        times = np.linspace(0.0, t_horizon, steps + 1)
-        return np.asarray(
-            [
-                self._ctrv_step(self.state, dt)[0:2]
-                for dt in times
-            ],
-            dtype=float,
-        )
-
-    def get_state(self):
-        return self.state.copy()
 
 
 def cluster_principal_dimensions(points, min_pc1_m, min_pc2_m):
@@ -734,22 +432,13 @@ class LaptopController:
         self.obstacle_ekf_measurement_std_m = 0.08 if self.OPERATING_MODE == 2 else 0.12
         self.obstacle_ekf_initial_position_std_m = 0.20
         self.obstacle_ekf_initial_velocity_std_m_s = 0.35
-        self.obstacle_ekf_initial_heading_std_rad = np.deg2rad(90.0)
-        self.obstacle_ekf_initial_phi_dot_std_rad_s = np.deg2rad(45.0)
-        self.process_noise_px = 0.04 if self.OPERATING_MODE == 2 else 0.06
-        self.process_noise_py = 0.04 if self.OPERATING_MODE == 2 else 0.06
-        self.process_noise_v = 0.10 if self.OPERATING_MODE == 2 else 0.14
-        self.process_noise_phi = np.deg2rad(8.0)
-        self.process_noise_phi_dot = np.deg2rad(12.0)
-        self.measurement_noise_px = self.obstacle_ekf_measurement_std_m
-        self.measurement_noise_py = self.obstacle_ekf_measurement_std_m
+        self.obstacle_ekf_accel_std_m_s2 = 0.10 if self.OPERATING_MODE == 2 else 0.14
         self.obstacle_heading_hold_speed_m_s = 0.04 if self.OPERATING_MODE == 2 else 0.03
+        self.obstacle_axis_smoothing_alpha = 0.20
+        self.obstacle_axis_min_aspect_ratio = 1.4
+        self.obstacle_axis_max_velocity_gap_rad = np.deg2rad(30.0)
         self.obstacle_ekf_static_speed_reset_m_s = 0.03 if self.OPERATING_MODE == 2 else 0.02
-        self.obstacle_turn_rate_epsilon_rad_s = 1e-3
-        self.obstacle_track_min_dt_s = 1e-3
-        self.obstacle_track_max_dt_s = 1.0
         self.obstacle_v_max_m_s = 2.0 if self.OPERATING_MODE == 2 else 1.5
-        self.obstacle_phi_dot_max_rad_s = np.deg2rad(60.0)
         self.obstacle_prediction_horizon_s = 10.0 if self.OPERATING_MODE == 2 else 4.0
         self.obstacle_prediction_step_s = 0.8
         self.obstacle_history_len = 60
@@ -1167,6 +856,12 @@ class LaptopController:
                 "length_axis_ne": length_axis_ne.tolist(),
                 "equivalent_radius_m": equivalent_radius_m,
                 "measurement_covariance": measurement_covariance.tolist(),
+                # Keep every return: prediction/CPA must describe the detected
+                # hull, not only its DBSCAN centroid.
+                "points_ne": np.asarray(
+                    [self.body_point_to_earth(point) for point in cluster_points],
+                    dtype=float,
+                ).tolist(),
             })
 
         obstacles.sort(key=lambda obstacle: obstacle["distance_m"])
@@ -1323,6 +1018,7 @@ class LaptopController:
             "timestamp_s": stamp_s,
             "robot_pos": [self.North, self.East],
             "robot_yaw_rad": self.Yaw,
+            "robot_velocity_ne": np.asarray(self.v_robot[0:2], dtype=float),
             "cloud": self.lidar_data if self.lidar_data is not None else [],
             "clusters": self.lidar_obstacles,
             "tracks": self.obstacle_track_visuals(),
@@ -1360,20 +1056,14 @@ class LaptopController:
                 "heading_hold_speed_m_s": self.obstacle_heading_hold_speed_m_s,
                 "static_speed_reset_m_s": self.obstacle_ekf_static_speed_reset_m_s,
                 "v_max_m_s": self.obstacle_v_max_m_s,
-                "phi_dot_max_rad_s": self.obstacle_phi_dot_max_rad_s,
                 "prediction_min_samples": self.obstacle_prediction_min_samples,
                 "prediction_min_time_span_s": self.obstacle_prediction_min_time_span_s,
                 "prediction_min_displacement_m": self.obstacle_prediction_min_displacement_m,
                 "prediction_min_speed_m_s": self.obstacle_prediction_min_speed_m_s,
                 "prediction_max_speed_std_m_s": self.obstacle_prediction_max_speed_std_m_s,
                 "prediction_max_heading_var_rad2": self.obstacle_prediction_max_heading_var_rad2,
-                "process_noise_px": self.process_noise_px,
-                "process_noise_py": self.process_noise_py,
-                "process_noise_v": self.process_noise_v,
-                "process_noise_phi": self.process_noise_phi,
-                "process_noise_phi_dot": self.process_noise_phi_dot,
-                "measurement_noise_px": self.measurement_noise_px,
-                "measurement_noise_py": self.measurement_noise_py,
+                "acceleration_noise_m_s2": self.obstacle_ekf_accel_std_m_s2,
+                "measurement_noise_m": self.obstacle_ekf_measurement_std_m,
                 "cluster_range_enabled": self.apf_cluster_range_enabled,
                 "risk_pc_scale": self.apf_risk_pc_scale,
                 "avoidance_pc_scale": self.apf_avoidance_pc_scale,
@@ -1449,62 +1139,64 @@ class LaptopController:
 
         return vel_body
 
-    def obstacle_ekf_config(self):
-        measurement_std_m = float(getattr(self, "obstacle_ekf_measurement_std_m", 0.08))
-        initial_speed_std_m_s = float(getattr(self, "obstacle_ekf_initial_velocity_std_m_s", 0.35))
-        return ObstacleEkfConfig(
-            process_noise_px=float(getattr(self, "process_noise_px", measurement_std_m)),
-            process_noise_py=float(getattr(self, "process_noise_py", measurement_std_m)),
-            process_noise_v=float(getattr(self, "process_noise_v", initial_speed_std_m_s)),
-            process_noise_phi=float(getattr(self, "process_noise_phi", np.deg2rad(8.0))),
-            process_noise_phi_dot=float(getattr(self, "process_noise_phi_dot", np.deg2rad(12.0))),
-            measurement_noise_px=float(getattr(self, "measurement_noise_px", measurement_std_m)),
-            measurement_noise_py=float(getattr(self, "measurement_noise_py", measurement_std_m)),
-            initial_position_std_m=float(getattr(self, "obstacle_ekf_initial_position_std_m", 0.2)),
-            initial_speed_std_m_s=initial_speed_std_m_s,
-            initial_heading_std_rad=float(getattr(self, "obstacle_ekf_initial_heading_std_rad", np.deg2rad(90.0))),
-            initial_turn_rate_std_rad_s=float(getattr(self, "obstacle_ekf_initial_phi_dot_std_rad_s", np.deg2rad(45.0))),
-            v_max_m_s=float(getattr(self, "obstacle_v_max_m_s", 1.5)),
-            phi_dot_max_rad_s=float(getattr(self, "obstacle_phi_dot_max_rad_s", np.deg2rad(60.0))),
-            heading_hold_speed_m_s=float(getattr(self, "obstacle_heading_hold_speed_m_s", 0.03)),
-            static_speed_reset_m_s=float(getattr(self, "obstacle_ekf_static_speed_reset_m_s", 0.02)),
-            turn_rate_epsilon_rad_s=float(getattr(self, "obstacle_turn_rate_epsilon_rad_s", 1e-3)),
-            min_dt_s=float(getattr(self, "obstacle_track_min_dt_s", 1e-3)),
-            max_dt_s=float(getattr(self, "obstacle_track_max_dt_s", 1.0)),
-        )
-
     def obstacle_ekf_process_noise(self, dt):
-        return ObstacleEKF(
-            np.zeros(5, dtype=float),
-            np.eye(5, dtype=float),
-            self.obstacle_ekf_config(),
-        ).process_noise(dt)
+        dt = max(float(dt), 1e-3)
+        q = float(self.obstacle_ekf_accel_std_m_s2) ** 2
+        dt2 = dt * dt
+        dt3 = dt2 * dt
+        dt4 = dt2 * dt2
+        return q * np.array([
+            [0.25 * dt4, 0.0, 0.5 * dt3, 0.0],
+            [0.0, 0.25 * dt4, 0.0, 0.5 * dt3],
+            [0.5 * dt3, 0.0, dt2, 0.0],
+            [0.0, 0.5 * dt3, 0.0, dt2],
+        ], dtype=float)
 
     def obstacle_measurement_covariance(self, centre_body):
         centre_body = np.asarray(centre_body, dtype=float).reshape(2)
-        config = self.obstacle_ekf_config()
         range_m = float(np.linalg.norm(centre_body)) if np.isfinite(centre_body).all() else 0.0
         yaw_rate_rad_s = float(abs(getattr(self, "sensed_imu_yaw_rate_rad_s", 0.0) or 0.0))
-        lateral_std_m = config.measurement_noise_py * (1.0 + 0.08 * range_m + 0.25 * range_m * yaw_rate_rad_s)
+        measurement_std_m = float(self.obstacle_ekf_measurement_std_m)
+        lateral_std_m = measurement_std_m * (1.0 + 0.08 * range_m + 0.25 * range_m * yaw_rate_rad_s)
         return np.diag(
             [
-                config.measurement_noise_px ** 2,
+                measurement_std_m ** 2,
                 lateral_std_m ** 2,
             ]
         )
 
     def obstacle_ekf_predict(self, state, covariance, dt):
-        ekf = ObstacleEKF(state, covariance, self.obstacle_ekf_config())
-        return ekf.predict(dt)
+        dt = max(float(dt), 0.0)
+        state = np.asarray(state, dtype=float).reshape(4)
+        covariance = np.asarray(covariance, dtype=float).reshape(4, 4)
+        transition = np.array([
+            [1.0, 0.0, dt, 0.0],
+            [0.0, 1.0, 0.0, dt],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ], dtype=float)
+        return (
+            transition @ state,
+            transition @ covariance @ transition.T + self.obstacle_ekf_process_noise(dt),
+        )
 
     def obstacle_ekf_update(self, state, covariance, measurement_ne, measurement_covariance=None):
+        state = np.asarray(state, dtype=float).reshape(4)
+        covariance = np.asarray(covariance, dtype=float).reshape(4, 4)
         measurement_ne = np.asarray(measurement_ne, dtype=float).reshape(2)
-        ekf = ObstacleEKF(state, covariance, self.obstacle_ekf_config())
-        return ekf.update(
-            measurement_ne[0],
-            measurement_ne[1],
-            measurement_covariance=measurement_covariance,
+        observation = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=float)
+        noise = (
+            self.obstacle_ekf_measurement_std_m ** 2 * np.eye(2, dtype=float)
+            if measurement_covariance is None
+            else np.asarray(measurement_covariance, dtype=float).reshape(2, 2)
         )
+        innovation = measurement_ne - observation @ state
+        innovation_covariance = observation @ covariance @ observation.T + noise
+        gain = covariance @ observation.T @ np.linalg.pinv(innovation_covariance)
+        corrected_state = state + gain @ innovation
+        correction = np.eye(4, dtype=float) - gain @ observation
+        corrected_covariance = correction @ covariance @ correction.T + gain @ noise @ gain.T
+        return corrected_state, corrected_covariance
 
     def obstacle_track_motion_is_stable(self, track):
         sample_count = int(track.get("stats_sample_count", 0))
@@ -1550,22 +1242,7 @@ class LaptopController:
     def obstacle_track_prediction_ne(self, track):
         if not self.obstacle_ekf_prediction_enabled:
             return np.empty((0, 2), dtype=float)
-
-        ekf = track.get("ekf")
-        if ekf is not None:
-            horizon_s = float(track.get("collision_time_s", np.nan))
-            if not np.isfinite(horizon_s) or horizon_s <= 0.0:
-                horizon_s = float(getattr(self, "obstacle_prediction_horizon_s", 0.0))
-            if horizon_s <= 0.0:
-                return np.empty((0, 2), dtype=float)
-            step_s = max(float(self.obstacle_prediction_step_s), 1e-3)
-            steps = max(int(np.ceil(horizon_s / step_s)), 1)
-            return ekf.get_predicted_trajectory(horizon_s, steps)
-
-        state = ObstacleEKF.normalise_state(
-            track.get("state", [np.nan, np.nan, 0.0, 0.0, 0.0]),
-            getattr(self, "obstacle_heading_hold_speed_m_s", 0.03),
-        )
+        state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
         if not np.isfinite(state).all():
             return np.empty((0, 2), dtype=float)
         horizon_s = float(track.get("collision_time_s", np.nan))
@@ -1574,71 +1251,26 @@ class LaptopController:
         if horizon_s <= 0.0:
             return np.empty((0, 2), dtype=float)
         step_s = max(float(self.obstacle_prediction_step_s), 1e-3)
-        steps = max(int(np.ceil(horizon_s / step_s)), 1)
-        return ObstacleEKF(
-            state,
-            track.get("covariance", np.eye(5, dtype=float)),
-            self.obstacle_ekf_config(),
-        ).get_predicted_trajectory(horizon_s, steps)
+        times_s = np.arange(0.0, horizon_s, step_s, dtype=float)
+        times_s = np.r_[times_s, horizon_s]
+        return state[:2] + times_s[:, None] * state[2:4]
 
     def obstacle_track_regularize_velocity(self, track):
-        state = np.asarray(track.get("state", [np.nan, np.nan, 0.0, 0.0]), dtype=float).reshape(-1)
-        if state.size == 4:
-            speed_m_s = float(np.linalg.norm(state[2:4]))
-            if speed_m_s < float(getattr(self, "obstacle_ekf_static_speed_reset_m_s", 0.0)):
-                track["state"][2:4] = 0.0
-            return
-
-        if state.size != 5:
-            return
-
-        if not bool(track.get("motion_stable", False)):
-            track["state"][2] = float(np.clip(track["state"][2], 0.0, self.obstacle_ekf_config().v_max_m_s))
-            return
-
-        predicted_velocity_ne = np.asarray(
-            self.obstacle_track_prediction_velocity_ne(track),
-            dtype=float,
-        ).reshape(2)
-        predicted_speed_m_s, predicted_heading_rad = velocity_ne_to_speed_heading(
-            predicted_velocity_ne,
-            fallback_heading_rad=float(track["state"][3]),
-            hold_speed_m_s=float(getattr(self, "obstacle_heading_hold_speed_m_s", 0.03)),
-        )
-        if predicted_speed_m_s >= float(getattr(self, "obstacle_heading_hold_speed_m_s", 0.03)):
-            track["state"][2] = predicted_speed_m_s
-            track["state"][3] = predicted_heading_rad
+        state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
+        speed_m_s = float(np.linalg.norm(state[2:4]))
+        if speed_m_s < float(self.obstacle_ekf_static_speed_reset_m_s):
+            track["state"][2:4] = 0.0
+        elif speed_m_s > float(self.obstacle_v_max_m_s):
+            track["state"][2:4] *= float(self.obstacle_v_max_m_s) / speed_m_s
 
     def sync_obstacle_track_fields(self, track):
-        if track.get("ekf") is None:
-            track["ekf"] = ObstacleEKF(
-                track.get("state", np.zeros(5, dtype=float)),
-                track.get("covariance", np.eye(5, dtype=float)),
-                self.obstacle_ekf_config(),
-            )
-        else:
-            track["ekf"].state = ObstacleEKF.normalise_state(
-                track.get("state", track["ekf"].get_state()),
-                getattr(self, "obstacle_heading_hold_speed_m_s", 0.03),
-            )
-            track["ekf"].covariance = ObstacleEKF.normalise_covariance(
-                track.get("covariance", track["ekf"].covariance),
-            )
-            track["ekf"]._clamp_state()
-        track["state"] = track["ekf"].get_state()
-        track["covariance"] = track["ekf"].covariance.copy()
-
-        state = ObstacleEKF.normalise_state(
-            track.get("state", [np.nan, np.nan, 0.0, 0.0, 0.0]),
-            getattr(self, "obstacle_heading_hold_speed_m_s", 0.03),
-        )
+        state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
+        covariance = np.asarray(track.get("covariance", np.eye(4)), dtype=float).reshape(4, 4)
         track["state"] = state
+        track["covariance"] = covariance
         track["pos_ne"] = state[0:2].copy()
-        track["vel_ne"] = heading_to_velocity_ne(state[2], state[3])
-        track["v_m_s"] = float(state[2])
-        track["phi_rad"] = float(state[3])
-        track["phi_dot_rad_s"] = float(state[4])
-        track["position_uncertainty_m2"] = float(np.trace(np.asarray(track.get("covariance", np.eye(5, dtype=float)), dtype=float)[0:2, 0:2]))
+        track["vel_ne"] = state[2:4].copy()
+        track["position_uncertainty_m2"] = float(np.trace(covariance[0:2, 0:2]))
 
         pc1_m = float(track.get("pc1_m", self.obstacle_min_pc1_m))
         pc2_m = float(track.get("pc2_m", self.obstacle_min_pc2_m))
@@ -1658,27 +1290,28 @@ class LaptopController:
             if np.isfinite(length_axis_ne).all() and axis_norm >= 1e-6
             else np.array([1.0, 0.0], dtype=float)
         )
+        if bool(track.get("motion_stable", False)) and track["pc1_m"] >= self.obstacle_axis_min_aspect_ratio * track["pc2_m"]:
+            state[2:4] = constrain_velocity_to_axis(
+                state[2:4], track["length_axis_ne"], self.obstacle_axis_max_velocity_gap_rad
+            )
+            track["state"] = state
+            track["vel_ne"] = state[2:4].copy()
 
-        if bool(track.get("motion_stable", False)):
-            display_velocity_ne = np.asarray(track.get("velocity_mean_ne", track["vel_ne"]), dtype=float).reshape(2)
-        else:
-            display_velocity_ne = np.asarray(track["vel_ne"], dtype=float).reshape(2)
+        display_velocity_ne = np.asarray(track["vel_ne"], dtype=float).reshape(2)
         if not np.isfinite(display_velocity_ne).all():
             display_velocity_ne = track["vel_ne"]
 
         speed_m_s = float(np.linalg.norm(display_velocity_ne))
         track["speed_m_s"] = speed_m_s
-        previous_heading_rad = float(track.get("heading_rad", state[3]))
+        previous_heading_rad = float(track.get("heading_rad", np.nan))
         if speed_m_s >= float(getattr(self, "obstacle_heading_hold_speed_m_s", 0.03)):
-            heading_rad = float(state[3]) if np.isfinite(state[3]) else float(np.arctan2(display_velocity_ne[1], display_velocity_ne[0]))
+            heading_rad = float(np.arctan2(display_velocity_ne[1], display_velocity_ne[0]))
             track["heading_rad"] = heading_rad
             track["heading_deg"] = float(np.rad2deg(heading_rad))
-            track["heading_axis_ne"] = (
-                display_velocity_ne / speed_m_s
-                if bool(track.get("motion_stable", False))
-                else track["length_axis_ne"].copy()
-            )
+            track["heading_axis_ne"] = display_velocity_ne / speed_m_s
         else:
+            if not np.isfinite(previous_heading_rad):
+                previous_heading_rad = float(np.arctan2(track["length_axis_ne"][1], track["length_axis_ne"][0]))
             track["heading_rad"] = wrap_angle(previous_heading_rad)
             track["heading_deg"] = float(np.rad2deg(track["heading_rad"]))
             track["heading_axis_ne"] = track["length_axis_ne"].copy()
@@ -1689,9 +1322,9 @@ class LaptopController:
             return
 
         if bool(track.get("motion_stable", False)):
-            track["prediction_model"] = "ctrv_ekf"
+            track["prediction_model"] = "cv_ekf"
         else:
-            track["prediction_model"] = "ctrv_ekf_warmup"
+            track["prediction_model"] = "cv_ekf_warmup"
         track["prediction_ne"] = self.obstacle_track_prediction_ne(track)
 
     def make_obstacle_track(
@@ -1709,14 +1342,16 @@ class LaptopController:
             [1.0, 0.0] if length_axis_ne is None else length_axis_ne,
             dtype=float,
         ).reshape(2)
-        config = self.obstacle_ekf_config()
+        covariance = np.diag([
+            self.obstacle_ekf_initial_position_std_m ** 2,
+            self.obstacle_ekf_initial_position_std_m ** 2,
+            self.obstacle_ekf_initial_velocity_std_m_s ** 2,
+            self.obstacle_ekf_initial_velocity_std_m_s ** 2,
+        ])
         track = {
             "id": self.apf_next_track_id,
-            "ekf": ObstacleEKF(
-                np.array([detection_ne[0], detection_ne[1], 0.0, 0.0, 0.0], dtype=float),
-                ObstacleEKF.initial_covariance(config),
-                config,
-            ),
+            "state": np.array([detection_ne[0], detection_ne[1], 0.0, 0.0], dtype=float),
+            "covariance": covariance,
             "stamp_s": float(stamp_s),
             "last_seen_s": float(stamp_s),
             "hit_count": 1,
@@ -1769,11 +1404,11 @@ class LaptopController:
     def predict_obstacle_track_to_time(self, track, stamp_s):
         now = float(stamp_s)
         dt = max(now - float(track.get("stamp_s", now)), 0.0)
-        if not np.isfinite(dt) or dt < float(getattr(self, "obstacle_track_min_dt_s", 1e-3)):
+        if not np.isfinite(dt) or dt < 1e-3:
             return
         state, covariance = self.obstacle_ekf_predict(
-            track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0, 0.0]),
-            track.get("covariance", np.eye(5, dtype=float)),
+            track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0]),
+            track.get("covariance", np.eye(4, dtype=float)),
             dt,
         )
         track["state"] = state
@@ -1809,7 +1444,9 @@ class LaptopController:
                 previous_axis = np.asarray(track.get("length_axis_ne", length_axis_ne), dtype=float).reshape(2)
                 if float(np.dot(length_axis_ne, previous_axis)) < 0.0:
                     length_axis_ne = -length_axis_ne
-                track["length_axis_ne"] = length_axis_ne
+                track["length_axis_ne"] = smooth_undirected_axis(
+                    previous_axis, length_axis_ne, self.obstacle_axis_smoothing_alpha
+                )
 
         history = track.setdefault("history_ne", [])
         history.append(pos_ne)
@@ -1820,9 +1457,12 @@ class LaptopController:
             detection_ne = np.asarray(detection_ne, dtype=float).reshape(2)
             if np.isfinite(detection_ne).all():
                 lidar_history = track.setdefault("lidar_history_ne", [])
+                lidar_times = track.setdefault("lidar_history_timestamps_s", [])
                 lidar_history.append(detection_ne.copy())
+                lidar_times.append(float(stamp_s))
                 if len(lidar_history) > self.obstacle_history_len:
                     del lidar_history[:-self.obstacle_history_len]
+                    del lidar_times[:-self.obstacle_history_len]
 
         speed_m_s = float(np.linalg.norm(vel_ne))
         heading_rad = float(np.arctan2(vel_ne[1], vel_ne[0])) if speed_m_s >= self.apf_dynamic_speed_threshold_m_s else np.nan
@@ -1833,9 +1473,6 @@ class LaptopController:
             "vel_ne": vel_ne,
             "speed_m_s": speed_m_s,
             "heading_rad": heading_rad,
-            "v_m_s": float(track.get("v_m_s", speed_m_s)),
-            "phi_rad": float(track.get("phi_rad", heading_rad if np.isfinite(heading_rad) else 0.0)),
-            "phi_dot_rad_s": float(track.get("phi_dot_rad_s", 0.0)),
             "pc1_m": track["pc1_m"],
             "pc2_m": track["pc2_m"],
         })
@@ -1867,8 +1504,6 @@ class LaptopController:
             track["pc2_mean_m"] = track.get("pc2_m", self.obstacle_min_pc2_m)
             track["pc1_var_m2"] = 0.0
             track["pc2_var_m2"] = 0.0
-            track["phi_dot_mean_rad_s"] = float(track.get("phi_dot_rad_s", 0.0))
-            track["phi_dot_var_rad_s2"] = 0.0
             track["displacement_m"] = 0.0
             track["motion_stable"] = False
             self.sync_obstacle_track_fields(track)
@@ -1942,14 +1577,6 @@ class LaptopController:
         track["pc1_m"] = track["pc1_mean_m"]
         track["pc2_m"] = track["pc2_mean_m"]
 
-        phi_dot_samples = np.asarray(
-            [float(sample.get("phi_dot_rad_s", 0.0)) for sample in samples],
-            dtype=float,
-        )
-        phi_dot_samples = phi_dot_samples[np.isfinite(phi_dot_samples)]
-        track["phi_dot_mean_rad_s"] = float(np.mean(phi_dot_samples)) if len(phi_dot_samples) > 0 else float(track.get("phi_dot_rad_s", 0.0))
-        track["phi_dot_var_rad_s2"] = float(np.var(phi_dot_samples)) if len(phi_dot_samples) > 0 else 0.0
-
         track["motion_stable"] = self.obstacle_track_motion_is_stable(track)
         self.obstacle_track_regularize_velocity(track)
         self.sync_obstacle_track_fields(track)
@@ -1980,9 +1607,6 @@ class LaptopController:
         obstacle["velocity_ne"] = np.asarray(track["vel_ne"], dtype=float).reshape(2).tolist()
         obstacle["velocity_mean_ne"] = np.asarray(track.get("velocity_mean_ne", track["vel_ne"]), dtype=float).reshape(2).tolist()
         obstacle["velocity_var_ne"] = np.asarray(track.get("velocity_var_ne", [0.0, 0.0]), dtype=float).reshape(2).tolist()
-        obstacle["v"] = float(track.get("v_m_s", 0.0))
-        obstacle["phi"] = float(track.get("phi_rad", np.nan))
-        obstacle["phi_dot"] = float(track.get("phi_dot_rad_s", 0.0))
         obstacle["speed_m_s"] = float(track.get("speed_m_s", 0.0))
         obstacle["speed_mean_m_s"] = float(track.get("speed_mean_m_s", obstacle["speed_m_s"]))
         obstacle["speed_var_m2_s2"] = float(track.get("speed_var_m2_s2", 0.0))
@@ -1990,8 +1614,6 @@ class LaptopController:
         obstacle["heading_deg"] = float(track.get("heading_deg", np.nan))
         obstacle["heading_mean_rad"] = float(track.get("heading_mean_rad", np.nan))
         obstacle["heading_var_rad2"] = float(track.get("heading_var_rad2", np.nan))
-        obstacle["phi_dot_mean_rad_s"] = float(track.get("phi_dot_mean_rad_s", track.get("phi_dot_rad_s", 0.0)))
-        obstacle["phi_dot_var_rad_s2"] = float(track.get("phi_dot_var_rad_s2", 0.0))
         obstacle["pc1_m"] = float(track.get("pc1_mean_m", track.get("pc1_m", self.obstacle_min_pc1_m)))
         obstacle["pc2_m"] = float(track.get("pc2_mean_m", track.get("pc2_m", self.obstacle_min_pc2_m)))
         obstacle["pc1_var_m2"] = float(track.get("pc1_var_m2", 0.0))
@@ -2004,9 +1626,12 @@ class LaptopController:
         obstacle["stats_sample_count"] = int(track.get("stats_sample_count", 0))
         obstacle["motion_stable"] = bool(track.get("motion_stable", False))
         obstacle["position_uncertainty_m2"] = float(track.get("position_uncertainty_m2", np.nan))
-        obstacle["covariance_trace"] = float(np.trace(np.asarray(track.get("covariance", np.eye(5, dtype=float)), dtype=float)))
-        obstacle["prediction_model"] = track.get("prediction_model", "ctrv_ekf")
+        obstacle["covariance_trace"] = float(np.trace(np.asarray(track.get("covariance", np.eye(4, dtype=float)), dtype=float)))
+        obstacle["prediction_model"] = track.get("prediction_model", "cv_ekf")
         obstacle["predicted_trajectory_ne"] = prediction_ne.tolist()
+        lidar_points_ne = np.asarray(obstacle.get("points_ne", []), dtype=float)
+        if lidar_points_ne.ndim == 2 and lidar_points_ne.shape[1] == 2:
+            track["lidar_points_ne"] = lidar_points_ne.tolist()
 
     def prune_obstacle_tracks(self, now):
         self.apf_obstacle_tracks = [
@@ -2031,9 +1656,6 @@ class LaptopController:
                 "velocity_ne",
                 "velocity_mean_ne",
                 "velocity_var_ne",
-                "v",
-                "phi",
-                "phi_dot",
                 "speed_m_s",
                 "speed_mean_m_s",
                 "speed_var_m2_s2",
@@ -2041,8 +1663,6 @@ class LaptopController:
                 "heading_deg",
                 "heading_mean_rad",
                 "heading_var_rad2",
-                "phi_dot_mean_rad_s",
-                "phi_dot_var_rad_s2",
                 "pc1_m",
                 "pc2_m",
                 "pc1_var_m2",
@@ -2107,8 +1727,8 @@ class LaptopController:
         for track_index, track in enumerate(self.apf_obstacle_tracks):
             dt = max(now - float(track.get("stamp_s", now)), 0.0)
             predicted_state, predicted_covariance = self.obstacle_ekf_predict(
-                track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0, 0.0]),
-                track.get("covariance", np.eye(5, dtype=float)),
+                track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0]),
+                track.get("covariance", np.eye(4, dtype=float)),
                 dt,
             )
             predicted_tracks.append((predicted_state, predicted_covariance))
@@ -2116,10 +1736,7 @@ class LaptopController:
 
             for detection_index, detection in enumerate(detection_positions):
                 distance = float(np.linalg.norm(detection - predicted_pos))
-                state_size = int(np.asarray(predicted_state, dtype=float).reshape(-1).size)
-                H = np.zeros((2, state_size), dtype=float)
-                H[0, 0] = 1.0
-                H[1, 1] = 1.0
+                H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
                 innovation = detection - predicted_pos
                 measurement_covariance = detections[detection_index][5]
                 innovation_covariance = H @ np.asarray(predicted_covariance, dtype=float) @ H.T + measurement_covariance
@@ -2252,15 +1869,13 @@ class LaptopController:
                 continue
 
             state, _ = self.obstacle_ekf_predict(
-                track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0, 0.0]),
-                track.get("covariance", np.eye(5, dtype=float)),
+                track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0]),
+                track.get("covariance", np.eye(4, dtype=float)),
                 max(now - float(track.get("stamp_s", now)), 0.0),
             )
-            velocity_ne = np.asarray(track.get("velocity_mean_ne", heading_to_velocity_ne(state[2], state[3])), dtype=float).reshape(2)
-            if not np.isfinite(velocity_ne).all():
-                velocity_ne = heading_to_velocity_ne(state[2], state[3])
+            velocity_ne = state[2:4].copy()
             speed_m_s = float(np.linalg.norm(velocity_ne))
-            heading_rad = float(state[3]) if speed_m_s >= 1e-3 else np.nan
+            heading_rad = float(np.arctan2(velocity_ne[1], velocity_ne[0])) if speed_m_s >= 1e-3 else np.nan
 
             # Preserve the complete statistical state so the visualised
             # trajectory uses the same acceleration/stability gates as the
@@ -2279,11 +1894,11 @@ class LaptopController:
             visuals.append({
                 "id": int(track["id"]),
                 "position_ne": state[0:2].copy(),
+                "state": state.copy(),
                 "velocity_ne": velocity_ne.copy(),
                 "speed_m_s": speed_m_s,
                 "heading_rad": heading_rad,
                 "heading_deg": float(np.rad2deg(heading_rad)) if np.isfinite(heading_rad) else np.nan,
-                "phi_dot_rad_s": float(state[4]),
                 "prediction_ne": prediction_ne.copy(),
                 "history_ne": history_ne.copy(),
                 "lidar_history_ne": lidar_history_ne.copy(),
@@ -2292,12 +1907,14 @@ class LaptopController:
                 "position_uncertainty_m2": float(track.get("position_uncertainty_m2", np.nan)),
                 "pc1_m": float(track.get("pc1_mean_m", track.get("pc1_m", self.obstacle_min_pc1_m))),
                 "pc2_m": float(track.get("pc2_mean_m", track.get("pc2_m", self.obstacle_min_pc2_m))),
+                "apf_ellipse_axis_ne": self.obstacle_length_axis_ne(track).copy(),
+                "lidar_motion_axis_ne": self.obstacle_length_axis_ne(track).copy(),
                 "virtual_position_ne": np.asarray(
                     track.get("virtual_position_ne", [np.nan, np.nan]),
                     dtype=float,
                 ).reshape(2).copy(),
                 "collision_time_s": float(track.get("collision_time_s", np.nan)),
-                "prediction_model": track.get("prediction_model", "ctrv_ekf"),
+                "prediction_model": track.get("prediction_model", "cv_ekf"),
                 "stats_sample_count": int(track.get("stats_sample_count", 0)),
                 "motion_stable": bool(track.get("motion_stable", False)),
                 "hit_count": int(track.get("hit_count", 0)),
@@ -2323,8 +1940,8 @@ class LaptopController:
                 continue
 
             predicted_state, _ = self.obstacle_ekf_predict(
-                track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0, 0.0]),
-                track.get("covariance", np.eye(5, dtype=float)),
+                track.get("state", np.r_[track.get("pos_ne", [np.nan, np.nan]), 0.0, 0.0]),
+                track.get("covariance", np.eye(4, dtype=float)),
                 max(now - float(track.get("stamp_s", now)), 0.0),
             )
             predicted_pos = predicted_state[0:2]
@@ -2353,6 +1970,17 @@ class LaptopController:
         return pc1_m, pc2_m
 
     def obstacle_length_axis_ne(self, obstacle):
+        state = np.asarray(obstacle.get("state", []), dtype=float).reshape(-1)
+        if state.size == 4 and np.isfinite(state).all():
+            velocity_ne = state[2:4]
+            velocity_norm = float(np.linalg.norm(velocity_ne))
+            if velocity_norm >= self.apf_dynamic_speed_threshold_m_s:
+                return velocity_ne / velocity_norm
+        for key in ("velocity_ne", "vel_ne", "velocity_mean_ne"):
+            velocity_ne = np.asarray(obstacle.get(key, [np.nan, np.nan]), dtype=float).reshape(2)
+            velocity_norm = float(np.linalg.norm(velocity_ne))
+            if np.isfinite(velocity_ne).all() and velocity_norm >= self.apf_dynamic_speed_threshold_m_s:
+                return velocity_ne / velocity_norm
         axis_ne = np.asarray(
             obstacle.get("length_axis_ne", [1.0, 0.0]),
             dtype=float,
@@ -2365,17 +1993,89 @@ class LaptopController:
     def apf_cpa_metrics(self, obs_pos_body, obs_vel_body, own_vel_body):
         if not self.obstacle_ekf_prediction_enabled:
             return np.nan, np.nan
+        tcpa_s, dcpa_m, _, _ = straight_line_cpa(
+            [0.0, 0.0], own_vel_body, obs_pos_body, obs_vel_body
+        )
+        return tcpa_s, dcpa_m
 
-        rel_vel = np.asarray(obs_vel_body, dtype=float).reshape(2) - np.asarray(own_vel_body, dtype=float).reshape(2)
-        obs_pos_body = np.asarray(obs_pos_body, dtype=float).reshape(2)
-        rel_speed_sq = float(np.dot(rel_vel, rel_vel))
+    def update_apf_virtual_obstacles(self):
+        """Log the same EKF/own-ship trajectories used for predicted CPA."""
+        self.apf_virtual_obstacles = []
+        if not self.obstacle_ekf_prediction_enabled:
+            return self.apf_virtual_obstacles
 
-        if rel_speed_sq < 1e-9:
-            return np.inf, float(np.linalg.norm(obs_pos_body))
+        horizon_s = float(self.apf_collision_horizon_s)
+        step_s = max(float(self.apf_prediction_dt_s), 0.05)
+        times_s = np.arange(0.0, horizon_s + 0.5 * step_s, step_s)
+        own_start_ne = np.array([float(self.North), float(self.East)], dtype=float)
+        measured_velocity_ne = np.asarray(self.v_robot[0:2], dtype=float).reshape(2)
+        speed_m_s = float(np.linalg.norm(measured_velocity_ne))
+        if not np.isfinite(speed_m_s) or speed_m_s < 1e-6:
+            speed_m_s = float(self.route_tracking_speed_m_s)
+        # CPA follows the vessel's present heading; the EKF velocity magnitude
+        # supplies speed only, so the plotted/control DCPA stays on the bow line.
+        own_velocity_ne = self.body_vector_to_earth(np.array([speed_m_s, 0.0]))
+        own_trajectory_ne = own_start_ne + times_s[:, None] * own_velocity_ne
 
-        tcpa = max(-float(np.dot(obs_pos_body, rel_vel)) / rel_speed_sq, 0.0)
-        dcpa = float(np.linalg.norm(obs_pos_body + rel_vel * tcpa))
-        return tcpa, dcpa
+        for track in self.apf_obstacle_tracks:
+            if not self.obstacle_track_motion_is_stable(track):
+                continue
+            start_ne = np.asarray(
+                track.get("pos_ne", track.get("position_ne", [np.nan, np.nan])),
+                dtype=float,
+            ).reshape(2)
+            predicted_start_ne, velocity_ne = self.obstacle_track_state_at(track, 0.0)
+            if predicted_start_ne is not None:
+                start_ne = np.asarray(predicted_start_ne, dtype=float).reshape(2)
+            if not np.isfinite(start_ne).all() or velocity_ne is None:
+                continue
+            velocity_ne = np.asarray(velocity_ne, dtype=float).reshape(2)
+            speed_m_s = float(np.linalg.norm(velocity_ne))
+            if not np.isfinite(velocity_ne).all() or speed_m_s < self.apf_dynamic_speed_threshold_m_s:
+                continue
+            tcpa_s, dcpa_m, own_cpa_ne, obstacle_cpa_ne = straight_line_cpa(
+                own_start_ne, own_velocity_ne, start_ne, velocity_ne, horizon_s
+            )
+            if tcpa_s <= 0.0:
+                continue
+            pc1_m, pc2_m = self.obstacle_pc_dimensions(track)
+            ellipse_axis_ne = velocity_ne / max(float(np.linalg.norm(velocity_ne)), 1e-6)
+            collision_level, _ = ellipse_level_and_away(
+                own_cpa_ne - obstacle_cpa_ne,
+                ellipse_axis_ne,
+                0.5 * pc1_m + self.apf_own_equivalent_radius_m,
+                0.5 * pc2_m + self.apf_own_equivalent_radius_m,
+            )
+            if collision_level >= float(self.apf_risk_pc_scale):
+                continue
+            centre_trajectory_ne = start_ne + times_s[:, None] * velocity_ne
+            self.apf_virtual_obstacles.append({
+                "label": -1000 - int(track.get("id", 0)), "virtual": True,
+                "track_id": int(track.get("id", 0)), "centre_ne": obstacle_cpa_ne.tolist(),
+                "centre_body": self.earth_point_to_body(obstacle_cpa_ne).tolist(),
+                "pc1_m": pc1_m, "pc2_m": pc2_m,
+                "length_axis_ne": ellipse_axis_ne.tolist(),
+                "apf_ellipse_axis_ne": ellipse_axis_ne.tolist(),
+                "lidar_motion_axis_ne": ellipse_axis_ne.tolist(),
+                "apf_ellipse_pc1_m": pc1_m,
+                "apf_ellipse_pc2_m": pc2_m,
+                "velocity_ne": velocity_ne.tolist(), "tcpa_s": tcpa_s,
+                "heading_rad": float(np.arctan2(velocity_ne[1], velocity_ne[0])),
+                "dcpa_m": dcpa_m,
+                "collision_position_ne": own_cpa_ne.tolist(),
+                "predicted_risk_active": True,
+                "collision_level": float(collision_level),
+                # The DCPA position is the EKF ship centre at TCPA, on its
+                # predicted heading line.  The LiDAR point remains evidence
+                # for the separation magnitude, not the field position.
+                "obstacle_dcpa_position_ne": obstacle_cpa_ne.tolist(),
+                "obstacle_min_separation_point_ne": obstacle_cpa_ne.tolist(),
+                "own_prediction_velocity_ne": own_velocity_ne.tolist(),
+                "own_prediction_heading_rad": float(self.Yaw),
+                "own_prediction_ne": own_trajectory_ne.tolist(),
+                "obstacle_prediction_ne": centre_trajectory_ne.tolist(),
+            })
+        return self.apf_virtual_obstacles
 
     def apf_pass_astern_side_from_velocity(self, obs_vel_body):
         obs_vel_body = np.asarray(obs_vel_body, dtype=float).reshape(2)
@@ -2517,22 +2217,10 @@ class LaptopController:
 
     def obstacle_track_state_at(self, track, dt_s):
         dt_s = max(float(dt_s), 0.0)
-        state = ObstacleEKF.normalise_state(
-            track.get("state", [np.nan, np.nan, 0.0, 0.0, 0.0]),
-            getattr(self, "obstacle_heading_hold_speed_m_s", 0.03),
-        )
+        state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
         if not np.isfinite(state).all():
             return None, None
-
-        ekf = ObstacleEKF(
-            state,
-            track.get("covariance", np.eye(5, dtype=float)),
-            self.obstacle_ekf_config(),
-        )
-        predicted_state = ekf._ctrv_step(state, dt_s)
-        pos_ne = predicted_state[0:2]
-        vel_ne = heading_to_velocity_ne(predicted_state[2], predicted_state[3])
-        return pos_ne, vel_ne
+        return state[:2] + state[2:4] * dt_s, state[2:4].copy()
 
     def virtual_collision_visuals(self):
         visuals = []

@@ -16,6 +16,8 @@ import subprocess
 import platform
 import copy
 
+from colreg_apf import constrain_velocity_to_axis, smooth_undirected_axis, straight_line_cpa
+
 from zeroros import Publisher, Subscriber
 from zeroros.messages import String, Vector3, Vector3Stamped, Pose, PoseStamped, RBLaserScan
 from zeroros.datalogger import DataLogger
@@ -273,6 +275,8 @@ class LaptopController:
         self.obstacle_log_dir = self.run_dir
         self.last_obstacle_snapshot_stamp_s = None
         self.webots_obstacle_truth = []
+        self.webots_robot_truth_ne = None
+        self.webots_robot_truth_yaw_rad = None
         self.webots_collision_detected = False
         self.webots_collision_record_written = False
         
@@ -441,6 +445,9 @@ class LaptopController:
         self.obstacle_ekf_initial_position_std_m = 0.20
         self.obstacle_ekf_initial_velocity_std_m_s = 0.35
         self.obstacle_heading_hold_speed_m_s = 0.03
+        self.obstacle_axis_smoothing_alpha = 0.20
+        self.obstacle_axis_min_aspect_ratio = 1.4
+        self.obstacle_axis_max_velocity_gap_rad = np.deg2rad(30.0)
         self.obstacle_prediction_horizon_s = 15.0
         self.obstacle_prediction_step_s = 0.5
         self.obstacle_history_len = 60
@@ -732,11 +739,16 @@ class LaptopController:
     def webots_obstacle_groundtruth_callback(self, msg: PoseStamped):
         pose = msg.pose
         try:
+            # LiDAR/obstacle tracking uses Webots x,-y as North,East.
             position_ne = [float(pose.position.x), -float(pose.position.y)]
             q = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
             yaw_rad = float(R.from_quat(q).as_euler("xyz")[2])
         except (TypeError, ValueError):
             return
+        if self.webots_obstacle_truth:
+            previous_ne = np.asarray(self.webots_obstacle_truth[-1]["position_ne"], dtype=float)
+            if np.linalg.norm(np.asarray(position_ne) - previous_ne) > 1.0:
+                self.webots_obstacle_truth.clear()
         self.webots_obstacle_truth.append({
             "t": float(self.timefromstart or 0.0),
             "position_ne": position_ne,
@@ -975,6 +987,10 @@ class LaptopController:
                 "length_axis_ne": length_axis_ne.tolist(),
                 "equivalent_radius_m": equivalent_radius_m,
                 "measurement_covariance": measurement_covariance.tolist(),
+                "points_ne": np.asarray(
+                    [self.body_point_to_earth(point) for point in cluster_points],
+                    dtype=float,
+                ).tolist(),
             })
 
         obstacles.sort(key=lambda obstacle: obstacle["distance_m"])
@@ -1126,11 +1142,20 @@ class LaptopController:
             return
 
         self.last_obstacle_snapshot_stamp_s = stamp_s
+        robot_truth_ne = np.asarray(
+            getattr(self, "webots_robot_truth_ne", [np.nan, np.nan]), dtype=float
+        ).reshape(2)
+        robot_pos = robot_truth_ne if np.isfinite(robot_truth_ne).all() else np.array([self.North, self.East])
+        robot_yaw_rad = getattr(self, "webots_robot_truth_yaw_rad", None)
+        if robot_yaw_rad is None or not np.isfinite(robot_yaw_rad):
+            robot_yaw_rad = self.Yaw
         payload = {
             "t": self.timefromstart,
             "timestamp_s": stamp_s,
-            "robot_pos": [self.North, self.East],
-            "robot_yaw_rad": self.Yaw,
+            "robot_pos": robot_pos,
+            "robot_yaw_rad": robot_yaw_rad,
+            "robot_pos_source": "webots_groundtruth" if np.isfinite(robot_truth_ne).all() else "ekf",
+            "robot_velocity_ne": np.asarray(self.v_robot[0:2], dtype=float),
             "cloud": self.lidar_data if self.lidar_data is not None else [],
             "clusters": self.lidar_obstacles,
             "tracks": self.obstacle_track_visuals(),
@@ -1448,6 +1473,12 @@ class LaptopController:
             if np.isfinite(length_axis_ne).all() and axis_norm >= 1e-6
             else np.array([1.0, 0.0], dtype=float)
         )
+        if bool(track.get("motion_stable", False)) and track["pc1_m"] >= self.obstacle_axis_min_aspect_ratio * track["pc2_m"]:
+            state[2:4] = constrain_velocity_to_axis(
+                state[2:4], track["length_axis_ne"], self.obstacle_axis_max_velocity_gap_rad
+            )
+            track["state"] = state
+            track["vel_ne"] = state[2:4].copy()
 
         ekf_velocity_ne = track["vel_ne"].copy()
         speed_m_s = float(np.linalg.norm(ekf_velocity_ne))
@@ -1603,7 +1634,9 @@ class LaptopController:
                 previous_axis = np.asarray(track.get("length_axis_ne", length_axis_ne), dtype=float).reshape(2)
                 if float(np.dot(length_axis_ne, previous_axis)) < 0.0:
                     length_axis_ne = -length_axis_ne
-                track["length_axis_ne"] = length_axis_ne
+                track["length_axis_ne"] = smooth_undirected_axis(
+                    previous_axis, length_axis_ne, self.obstacle_axis_smoothing_alpha
+                )
 
         history = track.setdefault("history_ne", [])
         history.append(pos_ne)
@@ -1782,6 +1815,9 @@ class LaptopController:
         obstacle["motion_stable"] = bool(track.get("motion_stable", False))
         obstacle["prediction_model"] = track.get("prediction_model", "ekf_constant_velocity")
         obstacle["predicted_trajectory_ne"] = prediction_ne.tolist()
+        lidar_points_ne = np.asarray(obstacle.get("points_ne", []), dtype=float)
+        if lidar_points_ne.ndim == 2 and lidar_points_ne.shape[1] == 2:
+            track["lidar_points_ne"] = lidar_points_ne.tolist()
 
     def prune_obstacle_tracks(self, now):
         self.apf_obstacle_tracks = [
@@ -2152,17 +2188,10 @@ class LaptopController:
     def apf_cpa_metrics(self, obs_pos_body, obs_vel_body, own_vel_body):
         if not self.obstacle_ekf_prediction_enabled:
             return np.nan, np.nan
-
-        rel_vel = np.asarray(obs_vel_body, dtype=float).reshape(2) - np.asarray(own_vel_body, dtype=float).reshape(2)
-        obs_pos_body = np.asarray(obs_pos_body, dtype=float).reshape(2)
-        rel_speed_sq = float(np.dot(rel_vel, rel_vel))
-
-        if rel_speed_sq < 1e-9:
-            return np.inf, float(np.linalg.norm(obs_pos_body))
-
-        tcpa = max(-float(np.dot(obs_pos_body, rel_vel)) / rel_speed_sq, 0.0)
-        dcpa = float(np.linalg.norm(obs_pos_body + rel_vel * tcpa))
-        return tcpa, dcpa
+        tcpa_s, dcpa_m, _, _ = straight_line_cpa(
+            [0.0, 0.0], own_vel_body, obs_pos_body, obs_vel_body
+        )
+        return tcpa_s, dcpa_m
 
     def apf_pass_astern_side_from_velocity(self, obs_vel_body):
         obs_vel_body = np.asarray(obs_vel_body, dtype=float).reshape(2)
@@ -2703,6 +2732,8 @@ class LaptopController:
         r = R.from_quat(q)  # note: [x, y, z, w] order
         roll, pitch, yaw = r.as_euler('xyz', degrees=True)  # radians                
         yaw = np.mod(yaw, 360.0)
+        self.webots_robot_truth_ne = np.array([n, e], dtype=float)
+        self.webots_robot_truth_yaw_rad = np.deg2rad(yaw)
 
         if self.pseudo_aruco_counter== 80: 
             self.pseudo_aruco_counter = 0

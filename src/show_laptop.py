@@ -96,16 +96,7 @@ class ShowLaptop(QWidget):
         plannedPathPlot = LiveLinePlot(pen = 'gray', name = 'Planned Path')
         apfWaypointPathPlot = LiveLinePlot(pen = 'cyan', name = 'APF Avoidance Path')
         apfWaypointPlot = LiveScatterPlot(symbol = 'o', size = 9, pen = 'cyan', name = 'APF Avoidance Waypoints')
-        apfForcePlot = LiveLinePlot(pen = 'yellow', name = 'APF Total Force')
-        apfRepulsivePlot = LiveLinePlot(pen = 'magenta', name = 'APF Repulsive Force')
-        apfSteeringPlot = LiveLinePlot(pen = 'cyan', name = 'APF Steering Force')
         apfTargetPlot = LiveScatterPlot(symbol = 't', size = 10, pen = 'orange', name = 'APF Target')
-        obstacleEkfPositionPlot = LiveScatterPlot(symbol = 'o', size = 8, pen = 'orange', name = 'Obstacle EKF Position')
-        obstacleVirtualPositionPlot = LiveScatterPlot(symbol = 'x', size = 12, pen = 'magenta', name = 'Obstacle Predicted Position')
-        virtualCollisionPositionPlot = LiveScatterPlot(symbol = 'd', size = 14, pen = 'yellow', name = 'Virtual Collision Position')
-        obstacleEkfHistoryPlot = LiveLinePlot(pen = 'green', name = 'LiDAR Cluster Centre Track (e-frame)')
-        obstacleEkfPredictionPlot = LiveLinePlot(pen = 'orange', name = 'Obstacle EKF Prediction (e-frame)')
-        obstacleEkfDirectionPlot = LiveLinePlot(pen = 'red', name = 'Obstacle Velocity (e-frame)')
         
         dtplot = LiveLinePlot(pen='blue', name = 'Laptop Update')
         Idtplot = LiveScatterPlot(symbol = 'x', pen = 'red', name = 'IMU Update')
@@ -128,16 +119,7 @@ class ShowLaptop(QWidget):
         self.planned_path = plot_connector(plannedPathPlot, 20, auto_range=True)
         self.apf_waypoint_path = plot_connector(apfWaypointPathPlot, 20)
         self.apf_waypoints = plot_connector(apfWaypointPlot, 20)
-        self.apf_force = plot_connector(apfForcePlot, 2)
-        self.apf_repulsive = plot_connector(apfRepulsivePlot, 2)
-        self.apf_steering = plot_connector(apfSteeringPlot, 2)
         self.apf_target = plot_connector(apfTargetPlot, 1)
-        self.obstacle_ekf_position = plot_connector(obstacleEkfPositionPlot, 50)
-        self.obstacle_virtual_position = plot_connector(obstacleVirtualPositionPlot, 50)
-        self.virtual_collision_position = plot_connector(virtualCollisionPositionPlot, 50)
-        self.obstacle_ekf_history = plot_connector(obstacleEkfHistoryPlot, 3000)
-        self.obstacle_ekf_prediction = plot_connector(obstacleEkfPredictionPlot, 1000)
-        self.obstacle_ekf_direction = plot_connector(obstacleEkfDirectionPlot, 200)
         
         self.dtplot = plot_connector(dtplot, 1500, auto_range=True)
         self.Idtplot = plot_connector(Idtplot, 1500)
@@ -184,16 +166,7 @@ class ShowLaptop(QWidget):
         self.positionplot.addItem(apfWaypointPathPlot)
         self.positionplot.addItem(apfWaypointPlot)
         self.positionplot.addItem(lidarplot)
-        self.positionplot.addItem(apfForcePlot)
-        self.positionplot.addItem(apfRepulsivePlot)
-        self.positionplot.addItem(apfSteeringPlot)
         self.positionplot.addItem(apfTargetPlot)
-        self.positionplot.addItem(obstacleEkfPositionPlot)
-        self.positionplot.addItem(obstacleVirtualPositionPlot)
-        self.positionplot.addItem(virtualCollisionPositionPlot)
-        self.positionplot.addItem(obstacleEkfHistoryPlot)
-        self.positionplot.addItem(obstacleEkfPredictionPlot)
-        self.positionplot.addItem(obstacleEkfDirectionPlot)
         self.timeplot.addItem(dtplot)
         self.timeplot.addItem(Idtplot)
         self.timeplot.addItem(Adtplot)
@@ -286,42 +259,7 @@ class ShowLaptop(QWidget):
             self._request_shutdown("goal_reached_stopped", mission_complete, left_rate, right_rate)
         
         
-    def _force_line_ne(self, force_body, scale=0.8):
-        if force_body is None or self.Laptop.North is None or self.Laptop.East is None:
-            return None
-
-        force_body = np.asarray(force_body, dtype=float).reshape(2)
-        if not np.isfinite(force_body).all():
-            return None
-
-        force_norm = float(np.linalg.norm(force_body))
-        if force_norm < 1e-6:
-            return None
-
-        origin_ne = np.array([float(self.Laptop.North), float(self.Laptop.East)], dtype=float)
-        force_ne = self.Laptop.body_vector_to_earth(force_body)
-        force_ne_norm = float(np.linalg.norm(force_ne))
-        if force_ne_norm < 1e-6 or not np.isfinite(force_ne_norm):
-            return None
-
-        line_len_m = min(1.2, max(0.25, scale * force_norm))
-        end_ne = origin_ne + force_ne / force_ne_norm * line_len_m
-        return [origin_ne[0], end_ne[0]], [origin_ne[1], end_ne[1]]
-
-    def _set_force_line(self, connector, force_body, scale=0.8):
-        line = self._force_line_ne(force_body, scale)
-        if line is None:
-            connector.cb_set_data([], [])
-            return
-
-        northings, eastings = line
-        connector.cb_set_data(northings, eastings)
-
     def _update_apf_plot(self):
-        self._set_force_line(self.apf_force, getattr(self.Laptop, "apf_force_body", None), scale=0.8)
-        self._set_force_line(self.apf_repulsive, getattr(self.Laptop, "apf_repulsive_force_body", None), scale=0.8)
-        self._set_force_line(self.apf_steering, getattr(self.Laptop, "apf_steering_force_body", None), scale=0.8)
-
         target_ne = np.asarray(
             getattr(self.Laptop, "apf_target_ne", [np.nan, np.nan]),
             dtype=float,
@@ -343,105 +281,6 @@ class ShowLaptop(QWidget):
         points_ne = points_ne[np.isfinite(points_ne[:, 0]) & np.isfinite(points_ne[:, 1])]
         self.apf_waypoint_path.cb_set_data(points_ne[:, 0], points_ne[:, 1])
         self.apf_waypoints.cb_set_data(points_ne[:, 0], points_ne[:, 1])
-
-    def _append_track_segments(self, northings, eastings, points_ne):
-        points_ne = np.asarray(points_ne, dtype=float)
-        if points_ne.ndim != 2 or points_ne.shape[0] < 2 or points_ne.shape[1] < 2:
-            return
-
-        finite = np.isfinite(points_ne[:, 0]) & np.isfinite(points_ne[:, 1])
-        points_ne = points_ne[finite]
-        if len(points_ne) < 2:
-            return
-
-        northings.extend(points_ne[:, 0].tolist())
-        eastings.extend(points_ne[:, 1].tolist())
-        northings.append(np.nan)
-        eastings.append(np.nan)
-
-    def _update_obstacle_tracks_plot(self):
-        tracks = self.Laptop.obstacle_track_visuals()
-        position_northings = []
-        position_eastings = []
-        virtual_northings = []
-        virtual_eastings = []
-        history_northings = []
-        history_eastings = []
-        prediction_northings = []
-        prediction_eastings = []
-        direction_northings = []
-        direction_eastings = []
-        summaries = []
-
-        for track in tracks:
-            position_ne = np.asarray(track.get("position_ne", [np.nan, np.nan]), dtype=float).reshape(2)
-            velocity_ne = np.asarray(track.get("velocity_ne", [0.0, 0.0]), dtype=float).reshape(2)
-
-            if not np.isfinite(position_ne).all():
-                continue
-
-            position_northings.append(position_ne[0])
-            position_eastings.append(position_ne[1])
-            track_id = int(track.get("id", 0))
-            virtual_position_ne = np.asarray(
-                track.get("virtual_position_ne", position_ne),
-                dtype=float,
-            ).reshape(2)
-            if np.isfinite(virtual_position_ne).all():
-                virtual_northings.append(virtual_position_ne[0])
-                virtual_eastings.append(virtual_position_ne[1])
-            self._append_track_segments(
-                history_northings,
-                history_eastings,
-                track.get("lidar_history_ne", []),
-            )
-            self._append_track_segments(prediction_northings, prediction_eastings, track.get("prediction_ne", []))
-
-            heading_deg = float(track.get("heading_deg", np.nan))
-            speed_m_s = float(track.get("speed_m_s", np.linalg.norm(velocity_ne)))
-            pc1_m = float(track.get("pc1_m", np.nan))
-            pc2_m = float(track.get("pc2_m", np.nan))
-            if np.isfinite(heading_deg):
-                summaries.append(
-                    f"#{track_id} {heading_deg:.0f}deg {speed_m_s:.2f}m/s "
-                    f"pc1={pc1_m:.2f} pc2={pc2_m:.2f}"
-                )
-
-            if np.isfinite(speed_m_s) and speed_m_s >= 1e-3 and np.isfinite(velocity_ne).all():
-                # velocity_ne is already in the e-frame; vector length encodes speed.
-                vector_len_m = float(np.clip(2.0 * speed_m_s, 0.15, 1.0))
-                direction_ne = velocity_ne / max(float(np.linalg.norm(velocity_ne)), 1e-6)
-                end_ne = position_ne + direction_ne * vector_len_m
-                direction_northings.extend([position_ne[0], end_ne[0], np.nan])
-                direction_eastings.extend([position_ne[1], end_ne[1], np.nan])
-
-        self.obstacle_ekf_position.cb_set_data(position_northings, position_eastings)
-        self.obstacle_virtual_position.cb_set_data(virtual_northings, virtual_eastings)
-        self.obstacle_ekf_history.cb_set_data(history_northings, history_eastings)
-        self.obstacle_ekf_prediction.cb_set_data(prediction_northings, prediction_eastings)
-        self.obstacle_ekf_direction.cb_set_data(direction_northings, direction_eastings)
-        collision_text = (
-            "Webots ShipObstacle collision: YES"
-            if getattr(self.Laptop, "webots_collision_detected", False)
-            else "Webots ShipObstacle collision: NO"
-        )
-        track_text = " | Obstacle EKF: " + " | ".join(summaries[:3]) if summaries else ""
-        self.obstacle_summary_signal.emit(collision_text + track_text)
-
-    def _update_virtual_collision_position_plot(self):
-        northings = []
-        eastings = []
-        for collision in self.Laptop.virtual_collision_visuals():
-            collision_position_ne = np.asarray(
-                collision.get("collision_position_ne", [np.nan, np.nan]),
-                dtype=float,
-            ).reshape(2)
-            if not np.isfinite(collision_position_ne).all():
-                continue
-            northings.append(collision_position_ne[0])
-            eastings.append(collision_position_ne[1])
-
-        self.virtual_collision_position.cb_set_data(northings, eastings)
 
     def _update_lidar_plot(self, lidar_cloud_ne):
         lidar_timestamp_s = self.Laptop.lidar_timestamp_s
@@ -546,8 +385,6 @@ class ShowLaptop(QWidget):
             self._update_lidar_plot(lidar_cloud_ne)
             self._update_apf_plot()
             self._update_apf_waypoints_plot()
-            self._update_obstacle_tracks_plot()
-            self._update_virtual_collision_position_plot()
             
             if lastdt != None:
                 self.dtplot.cb_append_data_point(lastdt, self.TFS)

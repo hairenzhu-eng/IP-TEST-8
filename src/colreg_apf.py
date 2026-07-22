@@ -3,6 +3,56 @@
 import numpy as np
 
 
+def straight_line_cpa(own_position, own_velocity, obstacle_position, obstacle_velocity, horizon_s=None):
+    """Continuous-time CPA for two constant-velocity trajectories."""
+    own_position = np.asarray(own_position, dtype=float).reshape(2)
+    own_velocity = np.asarray(own_velocity, dtype=float).reshape(2)
+    obstacle_position = np.asarray(obstacle_position, dtype=float).reshape(2)
+    obstacle_velocity = np.asarray(obstacle_velocity, dtype=float).reshape(2)
+    relative_position = obstacle_position - own_position
+    relative_velocity = obstacle_velocity - own_velocity
+    relative_speed_sq = float(np.dot(relative_velocity, relative_velocity))
+    tcpa_s = 0.0 if relative_speed_sq < 1e-12 else max(
+        -float(np.dot(relative_position, relative_velocity)) / relative_speed_sq,
+        0.0,
+    )
+    if horizon_s is not None:
+        tcpa_s = min(tcpa_s, max(float(horizon_s), 0.0))
+    own_cpa = own_position + own_velocity * tcpa_s
+    obstacle_cpa = obstacle_position + obstacle_velocity * tcpa_s
+    return tcpa_s, float(np.linalg.norm(obstacle_cpa - own_cpa)), own_cpa, obstacle_cpa
+
+
+def smooth_undirected_axis(previous_axis, measured_axis, alpha):
+    """Smooth a PCA axis after resolving its arbitrary 180-degree sign."""
+    previous = np.asarray(previous_axis, dtype=float).reshape(2)
+    measured = np.asarray(measured_axis, dtype=float).reshape(2)
+    previous /= max(float(np.linalg.norm(previous)), 1e-12)
+    measured /= max(float(np.linalg.norm(measured)), 1e-12)
+    if np.dot(previous, measured) < 0.0:
+        measured = -measured
+    blended = (1.0 - float(alpha)) * previous + float(alpha) * measured
+    return blended / max(float(np.linalg.norm(blended)), 1e-12)
+
+
+def constrain_velocity_to_axis(velocity, axis, max_gap_rad):
+    """Keep motion direction within max_gap_rad of an undirected hull axis."""
+    velocity = np.asarray(velocity, dtype=float).reshape(2)
+    axis = np.asarray(axis, dtype=float).reshape(2)
+    speed = float(np.linalg.norm(velocity))
+    axis_norm = float(np.linalg.norm(axis))
+    if speed < 1e-12 or axis_norm < 1e-12:
+        return velocity.copy()
+    direction = velocity / speed
+    axis = axis / axis_norm
+    if np.dot(direction, axis) < 0.0:
+        axis = -axis
+    gap = float(np.arctan2(direction[0] * axis[1] - direction[1] * axis[0], np.dot(direction, axis)))
+    correction = np.sign(gap) * max(abs(gap) - max(float(max_gap_rad), 0.0), 0.0)
+    c, s = np.cos(correction), np.sin(correction)
+    return speed * np.array([c * direction[0] - s * direction[1], s * direction[0] + c * direction[1]])
+
+
 def obstacle_stern_waypoint(centre_ne, velocity_ne, clearance_m):
     """Point behind the obstacle along its EKF motion direction."""
     centre = np.asarray(centre_ne, dtype=float).reshape(2)

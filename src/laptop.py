@@ -89,6 +89,9 @@ UNIFIED_APF_PARAMS = {
     "apf_crossing_pass_ahead_safe_dcpa_m": _mode_value(0.45, 0.60),
     "apf_track_association_m": _mode_value(0.60, 0.80),
     "apf_track_timeout_s": _mode_value(1.0, 1.5),
+    "obstacle_axis_smoothing_alpha": 0.20,
+    "obstacle_axis_min_aspect_ratio": 1.4,
+    "obstacle_axis_max_velocity_gap_rad": np.deg2rad(30.0),
     "obstacle_min_pc1_m": _mode_value(0.30, 0.36),
     "obstacle_min_pc2_m": _mode_value(0.16, 0.20),
     "apf_own_equivalent_radius_m": _mode_value(0.25, 0.30),
@@ -152,22 +155,22 @@ def _detect_webots_environment(operating_mode):
 
     try:
         if os.name == "nt":
-            result = subprocess.run(
+            commands = (
                 ["wmic", "process", "where", "name like '%webots%'", "get", "CommandLine", "/value"],
-                capture_output=True,
-                text=True,
-                timeout=0.8,
+                ["powershell", "-NoProfile", "-Command", "Get-CimInstance -Query \"SELECT CommandLine FROM Win32_Process WHERE Name LIKE '%webots%'\" | Select-Object -ExpandProperty CommandLine"],
             )
         else:
+            commands = (["ps", "-eo", "args"],)
+        for command in commands:
             result = subprocess.run(
-                ["ps", "-eo", "args"],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=0.8,
             )
-        detected = _world_name_from_text(result.stdout)
-        if detected:
-            return detected
+            detected = _world_name_from_text(result.stdout)
+            if detected:
+                return detected
     except Exception:
         pass
 
@@ -335,8 +338,6 @@ class LaptopController(_OvertakingController):
         return _CrossingController.obstacle_pc_dimensions(self, obstacle)
 
     def obstacle_length_axis_ne(self, obstacle):
-        if not self.apf_cluster_range_enabled:
-            return np.array([1.0, 0.0], dtype=float)
         return _CrossingController.obstacle_length_axis_ne(self, obstacle)
 
     def apf_direction_clearance_m(self, obstacle, *_args, **_kwargs):
@@ -467,71 +468,16 @@ class LaptopController(_OvertakingController):
         return self.start_ne + along[:, None] * route
 
     def obstacle_track_state_at(self, track, dt_s):
-        """Constant-velocity EKF prediction using its short-window estimate."""
-        dt_s = max(float(dt_s), 0.0)
-        state = np.asarray(
-            track.get("state", [np.nan, np.nan, 0.0, 0.0]),
-            dtype=float,
-        ).reshape(4)
-        if not np.isfinite(state).all():
+        """Predict the 4-D [north, east, v_north, v_east] EKF state."""
+        state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
+        position_ne = state[:2]
+        velocity_ne = state[2:4]
+        if not np.isfinite(position_ne).all() or not np.isfinite(velocity_ne).all():
             return None, None
-        velocity_ne = np.asarray(
-            track.get("velocity_mean_ne", state[2:4]),
-            dtype=float,
-        ).reshape(2)
-        if not np.isfinite(velocity_ne).all():
-            velocity_ne = state[2:4].copy()
-        return state[0:2] + velocity_ne * dt_s, velocity_ne.copy()
+        return position_ne + velocity_ne * max(float(dt_s), 0.0), velocity_ne.copy()
 
     def update_apf_virtual_obstacles(self):
-        self.apf_virtual_obstacles = []
-        if not self.obstacle_ekf_prediction_enabled:
-            return self.apf_virtual_obstacles
-
-        now = float(getattr(self, "latest_lidar_received_s", 0.0) or 0.0)
-        step_s = max(float(self.apf_prediction_dt_s), 0.05)
-        times_s = np.arange(0.0, float(self.apf_collision_horizon_s) + 0.5 * step_s, step_s)
-        own_trajectory_ne = self._predict_unavoided_route(times_s)
-        for track in self.apf_obstacle_tracks:
-            if now - float(track.get("last_seen_s", now)) > self.apf_track_timeout_s:
-                continue
-            if not self.obstacle_track_motion_is_stable(track):
-                continue
-
-            predicted_states = [self.obstacle_track_state_at(track, t) for t in times_s]
-            obstacle_trajectory_ne = np.asarray([state[0] for state in predicted_states], dtype=float)
-            distances = np.linalg.norm(own_trajectory_ne - obstacle_trajectory_ne, axis=1)
-            closest_index = int(np.argmin(distances))
-            tcpa_s = float(times_s[closest_index])
-            if tcpa_s <= 0.0:
-                continue
-
-            predicted_ne, predicted_vel_ne = predicted_states[closest_index]
-            separation = own_trajectory_ne[closest_index] - predicted_ne
-            pc1_m, pc2_m = self.obstacle_pc_dimensions(track)
-            level, _ = ellipse_level_and_away(
-                separation,
-                self.obstacle_length_axis_ne(track),
-                0.5 * pc1_m + self.apf_own_equivalent_radius_m,
-                0.5 * pc2_m + self.apf_own_equivalent_radius_m,
-            )
-            if level >= self.apf_predicted_field_size_scale:
-                continue
-
-            self.apf_virtual_obstacles.append({
-                "label": -1000 - int(track.get("id", 0)),
-                "virtual": True,
-                "centre_ne": predicted_ne.tolist(),
-                "centre_body": self.earth_point_to_body(predicted_ne).tolist(),
-                "pc1_m": pc1_m,
-                "pc2_m": pc2_m,
-                "length_axis_ne": self.obstacle_length_axis_ne(track).tolist(),
-                "velocity_ne": predicted_vel_ne.tolist(),
-                "tcpa_s": tcpa_s,
-                "dcpa_m": float(distances[closest_index]),
-                "collision_position_ne": own_trajectory_ne[closest_index].tolist(),
-            })
-        return self.apf_virtual_obstacles
+        return _CrossingController.update_apf_virtual_obstacles(self)
 
     def _route_normal_left_ne(self):
         unit = np.asarray(self.route_path_unit_ne, dtype=float).reshape(2)
@@ -1442,6 +1388,14 @@ class LaptopController(_OvertakingController):
 
     def write_obstacle_snapshot(self):
         stamp_s = self.latest_lidar_received_s
+        virtual_obstacles = self.update_apf_virtual_obstacles()
+        if virtual_obstacles:
+            closest = min(virtual_obstacles, key=lambda item: float(item["dcpa_m"]))
+            self.apf_colreg_dcpa_m = float(closest["dcpa_m"])
+            self.apf_colreg_tcpa_s = float(closest["tcpa_s"])
+        else:
+            self.apf_colreg_dcpa_m = np.nan
+            self.apf_colreg_tcpa_s = np.nan
         _OvertakingController.write_obstacle_snapshot(self)
         self._patch_latest_csv_context_row()
         if stamp_s is None:
@@ -1455,12 +1409,40 @@ class LaptopController(_OvertakingController):
             with path.open("r") as f:
                 payload = json.load(f)
             payload["run_context"] = self._run_context()
+            measured_velocity_ne = np.asarray(self.v_robot[0:2], dtype=float).reshape(2)
+            speed_m_s = float(np.linalg.norm(measured_velocity_ne))
+            if not np.isfinite(speed_m_s) or speed_m_s < 1e-6:
+                speed_m_s = float(self.route_tracking_speed_m_s)
+            forward_velocity_ne = self.body_vector_to_earth(np.array([speed_m_s, 0.0]))
+            payload["robot_ekf"] = {
+                "position_ne": [float(self.North), float(self.East)],
+                "velocity_ne": forward_velocity_ne,
+                "speed_m_s": speed_m_s,
+                "heading_rad": float(self.Yaw),
+            }
             apf = payload.setdefault("apf", {})
             apf["goal_ne"] = self.goal_ne
             apf["path_end_ne"] = self.goal_ne
             apf["selected_controller"] = self.apf_selected_controller
             apf["colreg_active"] = self.apf_colreg_active
             apf["active_profile"] = self.apf_active_profile_name
+            if virtual_obstacles:
+                apf["tcpa_s"] = float(closest["tcpa_s"])
+                apf["dcpa_m"] = float(closest["dcpa_m"])
+                apf["dcpa_position_ne"] = closest["centre_ne"]
+                apf["obstacle_dcpa_position_ne"] = closest["obstacle_dcpa_position_ne"]
+                apf["obstacle_min_separation_point_ne"] = closest["obstacle_min_separation_point_ne"]
+                apf["obstacle_ekf_prediction_velocity_ne"] = closest["velocity_ne"]
+                apf["obstacle_ekf_prediction_heading_rad"] = closest["heading_rad"]
+                apf["obstacle_apf_ellipse_axis_ne"] = closest["apf_ellipse_axis_ne"]
+                apf["obstacle_apf_ellipse_pc1_m"] = closest["apf_ellipse_pc1_m"]
+                apf["obstacle_apf_ellipse_pc2_m"] = closest["apf_ellipse_pc2_m"]
+                apf["robot_ekf_prediction_ne"] = closest["collision_position_ne"]
+                apf["robot_ekf_prediction_velocity_ne"] = closest["own_prediction_velocity_ne"]
+                apf["robot_ekf_prediction_heading_rad"] = closest["own_prediction_heading_rad"]
+            else:
+                apf.pop("tcpa_s", None)
+                apf.pop("dcpa_m", None)
             with path.open("w") as f:
                 json.dump(self.json_safe(payload), f, indent=2)
         except Exception:
