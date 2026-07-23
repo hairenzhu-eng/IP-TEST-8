@@ -814,13 +814,19 @@ def ellipse_potential(
         )
 
     pc1_m, pc2_m = obstacle_dimensions(obstacle, settings)
-    scale = positive(
-        settings.get("avoidance_pc_scale"),
-        settings.get("cluster_influence_scale", 6.0),
-    )
-    own_radius_m = positive(settings.get("own_equivalent_radius_m"), 0.0)
-    semi_length_m = max(0.5 * scale * pc1_m + own_radius_m, 1e-6)
-    semi_width_m = max(0.5 * scale * pc2_m + own_radius_m, 1e-6)
+    field_half_along_m = parse_float(obstacle.get("field_half_along_m"))
+    field_half_lateral_m = parse_float(obstacle.get("field_half_lateral_m"))
+    if np.isfinite(field_half_along_m) and np.isfinite(field_half_lateral_m):
+        semi_length_m = max(field_half_along_m, 1e-6)
+        semi_width_m = max(field_half_lateral_m, 1e-6)
+    else:
+        scale = positive(
+            settings.get("avoidance_pc_scale"),
+            settings.get("cluster_influence_scale", 6.0),
+        )
+        own_radius_m = positive(settings.get("own_equivalent_radius_m"), 0.0)
+        semi_length_m = max(0.5 * scale * pc1_m + own_radius_m, 1e-6)
+        semi_width_m = max(0.5 * scale * pc2_m + own_radius_m, 1e-6)
     axis = normalized_axis(obstacle.get("length_axis_ne"))
     width_axis = np.array([-axis[1], axis[0]], dtype=float)
 
@@ -914,7 +920,7 @@ def potential_components(
         k_goal,
     )
     current = np.zeros_like(north_grid)
-    dcpa = np.zeros_like(north_grid)
+    virtual = np.zeros_like(north_grid)
     tracks = [item for item in payload.get("tracks", []) if isinstance(item, dict)]
     virtuals = [
         item for item in payload.get("virtual_obstacles", [])
@@ -930,25 +936,18 @@ def potential_components(
             length_axis_ne=track_length_axis(track, payload),
         )
         current += ellipse_potential(north_grid, east_grid, current_obstacle, settings, k_obstacle)
-        track_id = track.get("id")
-        for virtual in virtuals:
-            if track_id is not None and virtual.get("label") not in {-1000 - int(track_id), track_id}:
-                continue
-            dcpa_ne = point(virtual.get("centre_ne"))
-            if dcpa_ne is None:
-                continue
-            dcpa_axis_ne = normalized_axis(
-                virtual.get("apf_ellipse_axis_ne", current_obstacle["length_axis_ne"])
-            )
-            dcpa += ellipse_potential(
-                north_grid,
-                east_grid,
-                dict(current_obstacle, centre_ne=dcpa_ne, length_axis_ne=dcpa_axis_ne),
-                settings,
-                k_obstacle,
-            )
-            break
-    return attractive, current, dcpa, target_ne
+    for field in virtuals:
+        centre_ne = point(field.get("centre_ne"))
+        if centre_ne is None:
+            continue
+        virtual += ellipse_potential(
+            north_grid,
+            east_grid,
+            dict(field, centre_ne=centre_ne, length_axis_ne=field.get("apf_ellipse_axis_ne")),
+            settings,
+            k_obstacle,
+        )
+    return attractive, current, virtual, target_ne
 
 
 def webots_truth_path(payload):
@@ -1215,7 +1214,7 @@ def _plot_snapshot_legacy(
     (
         attractive_potential_map,
         current_potential,
-        dcpa_potential,
+        virtual_potential,
         target_ne,
     ) = potential_components(
         north_grid,
@@ -1225,7 +1224,7 @@ def _plot_snapshot_legacy(
         k_goal,
         k_obstacle,
     )
-    total_potential = attractive_potential_map + current_potential + dcpa_potential
+    total_potential = attractive_potential_map + current_potential + virtual_potential
 
     fig, ax = plt.subplots(figsize=(10, 8), dpi=160)
     minimum = float(np.min(total_potential))
@@ -1249,7 +1248,7 @@ def _plot_snapshot_legacy(
     domain_level = float(k_obstacle) / np.e
     for field, color, linestyle in (
         (current_potential, "black", "-"),
-        (dcpa_potential, "#ff7f0e", "--"),
+        (virtual_potential, "#ff7f0e", "--"),
     ):
         if float(np.min(field)) <= domain_level <= float(np.max(field)):
             ax.contour(
@@ -1508,30 +1507,35 @@ def _plot_snapshot_legacy(
             label="Obstacle EKF position" if track_index == 0 else None,
             zorder=8,
         )
-        for virtual in payload.get("virtual_obstacles", []):
-            if not isinstance(virtual, dict) or not bool(virtual.get("predicted_risk_active", False)):
+        fields = [
+            field for field in payload.get("virtual_obstacles", [])
+            if isinstance(field, dict)
+            and bool(field.get("predicted_risk_active", False))
+            and field.get("label") in {-1000 - int(track.get("id", 0)), track.get("id")}
+        ]
+        final_field = next((field for field in reversed(fields) if not field.get("bridge", False)), None)
+        if final_field is not None:
+            final_position = point(final_field.get("centre_ne"))
+            if final_position is None:
                 continue
-            if virtual.get("label") not in {-1000 - int(track.get("id", 0)), track.get("id")}:
-                continue
-            dcpa_position = point(virtual.get("centre_ne"))
-            if dcpa_position is None:
-                continue
+            bridge_positions = [position] + [
+                point(field.get("centre_ne")) for field in fields if field.get("bridge", False)
+            ] + [final_position]
+            bridge_positions = [item for item in bridge_positions if item is not None]
+            if len(bridge_positions) >= 2:
+                bridge_path = np.asarray(bridge_positions, dtype=float)
+                ax.plot(
+                    bridge_path[:, 1], bridge_path[:, 0], color="#ff8c00", linestyle="--",
+                    linewidth=1.8, label="EKF artificial-potential bridge" if track_index == 0 else None,
+                    zorder=7,
+                )
             ax.scatter(
-                [dcpa_position[1]], [dcpa_position[0]], marker="X", s=90,
+                [final_position[1]], [final_position[0]], marker="X", s=90,
                 color="#ff7f0e", edgecolor="black", linewidth=0.7,
-                label="Obstacle DCPA position" if track_index == 0 else None,
+                label="2x TCPA virtual field" if track_index == 0 else None,
                 zorder=9,
             )
-            ax.plot(
-                [position[1], dcpa_position[1]],
-                [position[0], dcpa_position[0]],
-                color="#ff7f0e",
-                linestyle="--",
-                linewidth=1.8,
-                label="Obstacle straight EKF prediction" if track_index == 0 else None,
-                zorder=7,
-            )
-            own_cpa_position = point(virtual.get("collision_position_ne"))
+            own_cpa_position = point(final_field.get("collision_position_ne"))
             if own_cpa_position is not None:
                 ax.plot(
                     [robot_position[1], own_cpa_position[1]],
@@ -1539,19 +1543,9 @@ def _plot_snapshot_legacy(
                     color="#1f77b4",
                     linestyle="--",
                     linewidth=1.5,
-                    label="OS straight prediction" if track_index == 0 else None,
+                    label="OS TCPA prediction" if track_index == 0 else None,
                     zorder=7,
                 )
-                ax.plot(
-                    [own_cpa_position[1], dcpa_position[1]],
-                    [own_cpa_position[0], dcpa_position[0]],
-                    color="#ff7f0e",
-                    linestyle=":",
-                    linewidth=1.2,
-                    label="DCPA separation" if track_index == 0 else None,
-                    zorder=8,
-                )
-            break
         pc1_m, pc2_m = obstacle_dimensions(dict(track, centre_ne=position), settings)
         axis_ne = track_length_axis(track, payload)
         ax.add_patch(Ellipse(
@@ -1599,9 +1593,9 @@ def _plot_snapshot_legacy(
     if float(np.max(current_potential)) > 1e-9:
         handles.append(Line2D([0], [0], color="black", linewidth=1.0))
         labels.append("Current EKF potential boundary")
-    if float(np.max(dcpa_potential)) > 1e-9:
+    if float(np.max(virtual_potential)) > 1e-9:
         handles.append(Line2D([0], [0], color="#ff7f0e", linestyle="--", linewidth=1.0))
-        labels.append("DCPA potential boundary")
+        labels.append("2x TCPA virtual/bridge potential boundary")
     if clusters:
         if has_webots_real_position:
             handles.append(
@@ -1651,6 +1645,35 @@ def _plot_snapshot_legacy(
 
 
 plot_snapshot = _plot_snapshot_legacy
+
+
+def plot_snapshot_3d(snapshot, bounds, output_path, grid_size, target_time_s, default_target_ne, k_goal, k_obstacle):
+    """Render the same APF grid as a compact 3D potential surface."""
+    north_min, north_max, east_min, east_max = bounds
+    north_axis = np.linspace(north_min, north_max, grid_size)
+    east_axis = np.linspace(east_min, east_max, grid_size)
+    east_grid, north_grid = np.meshgrid(east_axis, north_axis)
+    attractive, current, virtual, _ = potential_components(
+        north_grid, east_grid, snapshot["payload"], default_target_ne, k_goal, k_obstacle,
+    )
+    total = attractive + current + virtual
+    fig = plt.figure(figsize=(10, 8), dpi=160)
+    ax = fig.add_subplot(111, projection="3d")
+    surface = ax.plot_surface(
+        east_grid, north_grid, total, cmap="coolwarm", linewidth=0, antialiased=True,
+        rcount=min(grid_size, 160), ccount=min(grid_size, 160),
+    )
+    fig.colorbar(surface, ax=ax, pad=0.1, shrink=0.65, label="Total APF potential, U")
+    ax.set(
+        title=f"3D APF potential at t={target_time_s:.1f} s",
+        xlabel="East (m)", ylabel="North (m)", zlabel="Potential, U",
+        xlim=(east_min, east_max), ylim=(north_min, north_max),
+    )
+    ax.view_init(elev=38, azim=-125)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
+    plt.close(fig)
 
 
 def generate_snapshots(
@@ -1746,6 +1769,16 @@ def generate_snapshots(
             k_obstacle=float(k_obstacle),
             quiver_step=quiver_step,
             run_collision_outcome=run_collision_outcome,
+        )
+        plot_snapshot_3d(
+            snapshot=snapshot,
+            bounds=bounds,
+            output_path=output_dir / f"apf_snapshot_3d_{colreg_label}_{target_time_s:06.1f}s.png",
+            grid_size=max(int(grid_size), 80),
+            target_time_s=target_time_s,
+            default_target_ne=default_target_ne,
+            k_goal=float(k_goal),
+            k_obstacle=float(k_obstacle),
         )
         outputs.append(output_path)
     return outputs

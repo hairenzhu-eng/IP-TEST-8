@@ -125,36 +125,74 @@ def obstacle_stern_waypoint(centre_ne, velocity_ne, clearance_m):
     return centre - max(float(clearance_m), 0.0) * velocity / speed
 
 
-def classify_colreg_zone(bearing_deg, relative_heading_deg, emergency=False):
-    """Classify the four Fig. 3 zones; side is +1 port, -1 starboard."""
+def classify_colreg_zone(
+    bearing_deg,
+    relative_heading_deg,
+    emergency=False,
+    own_speed_m_s=np.nan,
+    obstacle_speed_m_s=np.nan,
+    own_bearing_from_obstacle_deg=np.nan,
+):
+    """Classify by the obstacle's robot-relative sector, then its course."""
     bearing = float(bearing_deg) % 360.0
     heading = float(relative_heading_deg) % 360.0
-    zone_a = bearing >= 337.5 or bearing < 22.5
-    zone_b = 247.5 <= bearing < 337.5  # obstacle on port
-    zone_c = 22.5 <= bearing < 112.5   # obstacle on starboard
-    zone_d = 112.5 <= bearing < 247.5
+    ahead = bearing >= 292.5 or bearing < 67.5
+    astern = 112.5 <= bearing < 247.5
+    on_port = 247.5 <= bearing < 337.5
+    on_starboard = 22.5 <= bearing < 112.5
+    same_course = heading < 67.5 or heading >= 292.5
+    # Rule 13 must be deliberately stricter than the general ahead/same-course
+    # sectors.  Otherwise a crossing vessel can briefly look like a vessel
+    # ahead when its measured bearing or heading jitters near a sector edge.
+    # Rule 14 uses the original COLREG capture sector.
+    head_on_ahead = bearing >= 292.5 or bearing < 67.5
+    head_on_reciprocal = 157.5 <= heading < 202.5
+    overtaking_ahead = bearing >= 340.0 or bearing < 20.0
+    overtaking_same_course = heading < 20.0 or heading >= 340.0
+    own_bearing_from_obstacle_deg = float(own_bearing_from_obstacle_deg) % 360.0
+    own_in_obstacle_stern_sector = (
+        np.isfinite(own_bearing_from_obstacle_deg)
+        and 150.0 <= own_bearing_from_obstacle_deg < 210.0
+    )
+    own_speed_m_s = float(own_speed_m_s)
+    obstacle_speed_m_s = float(obstacle_speed_m_s)
+    speed_known = np.isfinite(own_speed_m_s) and np.isfinite(obstacle_speed_m_s)
+    obstacle_lateral_speed_m_s = abs(
+        obstacle_speed_m_s * np.sin(np.deg2rad(heading))
+    ) if np.isfinite(obstacle_speed_m_s) else np.inf
 
-    if zone_a:
-        if 157.5 <= heading < 202.5:
-            return "head_on", 1.0, "COLREG Rule 14: both alter to starboard"
+    if head_on_ahead and head_on_reciprocal:
+        # Planner side -1 is route-right/starboard.  Keep this aligned
+        # with Rule 13 so both dynamic manoeuvres always pass right.
+        return "head_on", -1.0, "COLREG Rule 14: both alter to starboard"
+
+    if ahead:
+        if (
+            speed_known
+            and overtaking_ahead
+            and overtaking_same_course
+            and own_in_obstacle_stern_sector
+            and own_speed_m_s > obstacle_speed_m_s + 0.08
+            and obstacle_lateral_speed_m_s <= 0.06
+        ):
+            return "overtaking", -1.0, "COLREG Rule 13: overtake on starboard side"
         if 67.5 <= heading < 157.5:
             return "crossing_from_port", 0.0, "COLREG Rule 15: stand on"
         if 202.5 <= heading < 292.5:
             return "crossing_from_starboard", -1.0, "COLREG Rule 15: give way, pass astern"
-        return "overtaking", 1.0, "COLREG Rule 13: overtake to starboard"
 
-    if zone_b and heading < 180.0:
+    if astern and same_course and (not speed_known or own_speed_m_s < obstacle_speed_m_s):
+        return "being_overtaken", 0.0, "COLREG Rule 13: keep course and speed"
+
+    if on_port:
         return (
             "crossing_from_port",
             -1.0 if emergency else 0.0,
             "COLREG Rule 17: emergency starboard action" if emergency else "COLREG Rule 17: stand on",
         )
 
-    if zone_c and heading >= 180.0:
+    if on_starboard:
         return "crossing_from_starboard", -1.0, "COLREG Rule 15: give way, pass astern"
-
-    if zone_d and (heading >= 292.5 or heading < 67.5):
-        return "being_overtaken", 0.0, "COLREG Rule 13: keep course and speed"
 
     return "static_obstacle", 0.0, "none"
 

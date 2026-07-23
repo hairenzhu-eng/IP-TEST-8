@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
 
+from plot_apf_snapshots import break_path_jumps
 from plot_colreg_size_trajectories import read_trajectory
 from plot_log_sources import resolve_run_dir
 from webots_collision import collision_detected, collision_outcome_text
@@ -910,9 +911,10 @@ def plot_webots_trajectory_comparison(environment, switch_logs, output_path):
         if len(times) < 2:
             continue
         label, color, linestyle = SWITCH_STYLES[switch]
+        trajectory_plot_ne_m = break_path_jumps(trajectory_ne_m)
         ax.plot(
-            trajectory_ne_m[:, 1],
-            trajectory_ne_m[:, 0],
+            trajectory_plot_ne_m[:, 1],
+            trajectory_plot_ne_m[:, 0],
             color=color,
             linestyle=linestyle,
             linewidth=2.0,
@@ -997,9 +999,10 @@ def plot_postprocess(
 
     if robot_points:
         robot_array = np.asarray(robot_points, dtype=float)
+        robot_plot_array = break_path_jumps(robot_array)
         ax.plot(
-            robot_array[:, 1],
-            robot_array[:, 0],
+            robot_plot_array[:, 1],
+            robot_plot_array[:, 0],
             color="#1f77b4",
             linewidth=1.8,
             alpha=0.90,

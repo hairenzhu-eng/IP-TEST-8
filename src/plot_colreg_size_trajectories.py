@@ -21,6 +21,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 
 from plot_log_sources import list_resolved_run_dirs, resolve_run_dir
+from plot_apf_snapshots import break_path_jumps, load_robot_trajectory
 from webots_collision import collision_detected, collision_outcome_text
 
 
@@ -29,11 +30,6 @@ DEFAULT_LOGS_DIR = PROJECT_ROOT / "logs"
 DEFAULT_OUTPUT_DIR = DEFAULT_LOGS_DIR / "generated_figures" / "colreg_size_trajectories"
 DEFAULT_LATEST_LIMIT = 0
 
-TIME_COLUMNS = ("TimeFromStart(s)", "TimeFromStart", "elapsed [s]")
-OWN_NORTH_COLUMNS = ("North(m)", "North", "x [m]")
-OWN_EAST_COLUMNS = ("East(m)", "East", "y [m]")
-ARUCO_NORTH_COLUMNS = ("ARUCOSensedNorth(m)", "ARUCOSensedNorth")
-ARUCO_EAST_COLUMNS = ("ARUCOSensedEast(m)", "ARUCOSensedEast")
 SWITCH_FLAGS = {
     "ekf_on_cluster_on": (True, True),
     "ekf_on_cluster_off": (True, False),
@@ -60,8 +56,6 @@ class RunRecord:
     webots_pair_key: str
     trajectory_time_s: np.ndarray
     trajectory_ne_m: np.ndarray
-    aruco_time_s: np.ndarray | None
-    aruco_ne_m: np.ndarray | None
     active_window_s: tuple[float, float]
     median_pc1_m: float
     median_pc2_m: float
@@ -88,13 +82,6 @@ def parse_float(value):
 def positive_float(value):
     value = parse_float(value)
     return value if np.isfinite(value) and value > 0.0 else np.nan
-
-
-def first_existing(row, names):
-    for name in names:
-        if name in row:
-            return row[name]
-    return None
 
 
 def parse_bool(value):
@@ -272,164 +259,9 @@ def find_primary_csv(run_dir):
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def find_pseudo_aruco_csv(run_dir):
-    candidates = list(run_dir.glob("log_*_pseudo_aruco.csv"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
-
-
-def read_trajectory_csv(log_path, north_columns, east_columns):
-    times = []
-    points = []
-    first_time_s = np.nan
-
-    with log_path.open(newline="", encoding="utf-8-sig") as stream:
-        reader = csv.DictReader(stream)
-        if reader.fieldnames is None:
-            raise ValueError(f"{log_path} has no CSV header")
-
-        for row in reader:
-            time_s = parse_float(first_existing(row, TIME_COLUMNS))
-            north_m = parse_float(first_existing(row, north_columns))
-            east_m = parse_float(first_existing(row, east_columns))
-            if not (
-                np.isfinite(time_s)
-                and np.isfinite(north_m)
-                and np.isfinite(east_m)
-            ):
-                continue
-            if not np.isfinite(first_time_s):
-                first_time_s = float(time_s)
-            times.append(float(time_s))
-            points.append([north_m, east_m])
-
-    if not times:
-        raise ValueError(f"No valid trajectory samples in {log_path}")
-
-    time_array = np.asarray(times, dtype=float)
-    trajectory_ne_m = np.asarray(points, dtype=float)
-    order = np.argsort(time_array)
-    time_array = time_array[order]
-    trajectory_ne_m = trajectory_ne_m[order]
-    time_array -= float(first_time_s) if np.isfinite(first_time_s) else time_array[0]
-    time_array, trajectory_ne_m = remove_motion_outliers(time_array, trajectory_ne_m)
-    time_array, trajectory_ne_m = remove_isolated_spikes(time_array, trajectory_ne_m)
-    return time_array, trajectory_ne_m
-
-
-def remove_motion_outliers(time_s, ne_m):
-    if len(ne_m) < 3:
-        return time_s, ne_m
-
-    dt_s = np.diff(time_s)
-    step_m = np.linalg.norm(np.diff(ne_m, axis=0), axis=1)
-    valid = dt_s > 0.0
-    normal_speed_m_s = median_of(step_m[valid] / dt_s[valid])
-    if not np.isfinite(normal_speed_m_s):
-        return time_s, ne_m
-
-    max_speed_m_s = max(1.5, normal_speed_m_s * 8.0)
-    keep = [0]
-    last_time_s = float(time_s[0])
-    last_point = ne_m[0]
-    for index in range(1, len(ne_m)):
-        dt_from_last_s = time_s[index] - last_time_s
-        if dt_from_last_s <= 0.0:
-            continue
-        step_from_last_m = float(np.linalg.norm(ne_m[index] - last_point))
-        if step_from_last_m <= max_speed_m_s * dt_from_last_s + 0.25:
-            keep.append(index)
-            last_point = ne_m[index]
-        last_time_s = float(time_s[index])
-
-    keep = np.asarray(keep, dtype=int)
-    return time_s[keep], ne_m[keep]
-
-
-def remove_isolated_spikes(time_s, ne_m):
-    if len(ne_m) < 3:
-        return time_s, ne_m
-
-    keep = np.ones(len(ne_m), dtype=bool)
-    while True:
-        kept_indices = np.flatnonzero(keep)
-        if len(kept_indices) < 3:
-            break
-        kept_points = ne_m[kept_indices]
-        step_m = np.linalg.norm(np.diff(kept_points, axis=0), axis=1)
-        normal_step_m = median_of(step_m[step_m > 0.0])
-        if not np.isfinite(normal_step_m):
-            break
-
-        spike_step_m = max(1.0, normal_step_m * 8.0)
-        sharp_step_m = normal_step_m * 2.5
-        reconnect_step_m = max(0.5, normal_step_m * 4.0)
-        remove_index = None
-        for local_index in range(1, len(kept_indices) - 1):
-            prev_step_m = step_m[local_index - 1]
-            next_step_m = step_m[local_index]
-            reconnect_m = float(
-                np.linalg.norm(kept_points[local_index + 1] - kept_points[local_index - 1])
-            )
-            is_big_spike = (
-                (
-                    prev_step_m > spike_step_m
-                    and next_step_m > spike_step_m
-                )
-                or (
-                    prev_step_m > sharp_step_m
-                    and next_step_m > sharp_step_m
-                    and prev_step_m + next_step_m > reconnect_m * 6.0
-                )
-            )
-            if is_big_spike and reconnect_m <= reconnect_step_m:
-                remove_index = kept_indices[local_index]
-                break
-        if remove_index is None:
-            break
-        keep[remove_index] = False
-
-    return time_s[keep], ne_m[keep]
-
-
 def read_trajectory(log_path, run_dir):
-    pseudo_aruco_path = find_pseudo_aruco_csv(run_dir)
-    if pseudo_aruco_path is not None:
-        try:
-            return read_trajectory_csv(
-                pseudo_aruco_path,
-                OWN_NORTH_COLUMNS,
-                OWN_EAST_COLUMNS,
-            )
-        except ValueError:
-            pass
-
-    try:
-        return read_trajectory_csv(
-            log_path,
-            ARUCO_NORTH_COLUMNS,
-            ARUCO_EAST_COLUMNS,
-        )
-    except ValueError:
-        pass
-
-    return read_trajectory_csv(
-        log_path,
-        OWN_NORTH_COLUMNS,
-        OWN_EAST_COLUMNS,
-    )
-
-
-def read_aruco_trajectory(log_path):
-    try:
-        return read_trajectory_csv(
-            log_path,
-            ARUCO_NORTH_COLUMNS,
-            ARUCO_EAST_COLUMNS,
-        )
-    except ValueError:
-        return None, None
+    del log_path
+    return load_robot_trajectory(run_dir)
 
 
 def obstacle_candidates(payload):
@@ -534,7 +366,6 @@ def build_run_record(run_dir):
         return None
 
     trajectory_time_s, trajectory_ne_m = read_trajectory(log_path, run_dir)
-    aruco_time_s, aruco_ne_m = read_aruco_trajectory(log_path)
     active_times = np.asarray([sample.time_s for sample in samples], dtype=float)
     active_window_s = (float(np.min(active_times)), float(np.max(active_times)))
 
@@ -560,8 +391,6 @@ def build_run_record(run_dir):
         webots_pair_key=webots_pair,
         trajectory_time_s=trajectory_time_s,
         trajectory_ne_m=trajectory_ne_m,
-        aruco_time_s=aruco_time_s,
-        aruco_ne_m=aruco_ne_m,
         active_window_s=active_window_s,
         median_pc1_m=median_pc1_m,
         median_pc2_m=median_pc2_m,
@@ -591,61 +420,44 @@ def selected_run_dirs(logs_dir, run_dirs):
     return resolved
 
 
-def segment_samples_for_plot(time_s, ne_m, active_window_s, padding_s):
-    start_s, _ = active_window_s
-    lower_s = max(time_s[0], start_s - padding_s)
-    mask = time_s >= lower_s
-    if np.count_nonzero(mask) < 2:
-        return ne_m
-    return ne_m[mask]
-
-
-def segment_for_plot(record, padding_s):
-    return segment_samples_for_plot(
-        record.trajectory_time_s,
-        record.trajectory_ne_m,
-        record.active_window_s,
-        padding_s,
-    )
-
-
 def merged_output_name(records):
     merged = "__".join(record.webots_environment for record in records)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", merged).strip("_")
     return safe_name or "large_vs_small"
 
 
-def plot_group(records, output_path, padding_s):
+def plot_group(records, output_path):
     colors = {"Small": "#0072B2", "Large": "#D55E00"}
     fig, ax = plt.subplots(figsize=(9.5, 7.5))
 
     for record in sorted(records, key=lambda item: (item.size_label, item.size_metric_m, item.run_dir.name)):
-        segment_ne_m = segment_for_plot(record, padding_s)
+        trajectory_ne_m = record.trajectory_ne_m
         label = (
             f"{record.size_label} {record.run_dir.name} "
             f"(pc1={record.median_pc1_m:.2f} m; "
             f"{collision_outcome_text(record.run_dir)})"
         )
         color = colors.get(record.size_label, "#333333")
+        trajectory_plot_ne_m = break_path_jumps(trajectory_ne_m)
         ax.plot(
-            segment_ne_m[:, 1],
-            segment_ne_m[:, 0],
+            trajectory_plot_ne_m[:, 1],
+            trajectory_plot_ne_m[:, 0],
             linewidth=2.0,
             color=color,
             alpha=0.88,
             label=label,
         )
         ax.scatter(
-            segment_ne_m[0, 1],
-            segment_ne_m[0, 0],
+            trajectory_ne_m[0, 1],
+            trajectory_ne_m[0, 0],
             color=color,
             marker="o",
             s=22,
             alpha=0.8,
         )
         ax.scatter(
-            segment_ne_m[-1, 1],
-            segment_ne_m[-1, 0],
+            trajectory_ne_m[-1, 1],
+            trajectory_ne_m[-1, 0],
             color=color,
             marker="x",
             s=42,
@@ -653,7 +465,7 @@ def plot_group(records, output_path, padding_s):
         )
         ax.annotate(
             record.size_label,
-            xy=(segment_ne_m[-1, 1], segment_ne_m[-1, 0]),
+            xy=(trajectory_ne_m[-1, 1], trajectory_ne_m[-1, 0]),
             xytext=(6, 6),
             textcoords="offset points",
             color=color,
@@ -729,7 +541,6 @@ def pair_large_small_records(records):
 def plot_colreg_size_trajectories(
     logs_dir,
     output_dir,
-    padding_s=2.0,
     latest_limit=DEFAULT_LATEST_LIMIT,
     run_dirs=None,
 ):
@@ -752,7 +563,7 @@ def plot_colreg_size_trajectories(
     outputs = []
     for pair in pairs:
         output_path = output_dir / f"{merged_output_name(pair)}.png"
-        plot_group(pair, output_path, padding_s=padding_s)
+        plot_group(pair, output_path)
         outputs.append((output_path, pair))
     return outputs
 
@@ -766,12 +577,6 @@ def main():
     )
     parser.add_argument("--logs-dir", type=Path, default=DEFAULT_LOGS_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument(
-        "--padding-s",
-        type=float,
-        default=2.0,
-        help="Trajectory padding before and after the active obstacle window.",
-    )
     parser.add_argument(
         "--latest-limit",
         type=int,
@@ -789,7 +594,6 @@ def main():
     outputs = plot_colreg_size_trajectories(
         logs_dir=args.logs_dir,
         output_dir=args.output_dir,
-        padding_s=float(args.padding_s),
         latest_limit=args.latest_limit,
         run_dirs=args.run_dirs,
     )

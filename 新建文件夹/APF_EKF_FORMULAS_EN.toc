@@ -1,0 +1,34 @@
+\contentsline {section}{Abbreviations and full forms}{3}{section*.2}%
+\contentsline {section}{\numberline {1}Six-state vessel EKF}{3}{section.1}%
+\contentsline {subsection}{\numberline {1.1}State vector and motion model}{3}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}State-transition Jacobian}{4}{subsection.1.2}%
+\contentsline {subsection}{\numberline {1.3}Prediction step}{5}{subsection.1.3}%
+\contentsline {subsection}{\numberline {1.4}Pose and yaw-rate measurement models}{5}{subsection.1.4}%
+\contentsline {subsection}{\numberline {1.5}Measurement update}{6}{subsection.1.5}%
+\contentsline {section}{\numberline {2}Four-state obstacle constant-velocity EKF}{6}{section.2}%
+\contentsline {subsection}{\numberline {2.1}State vector and constant-velocity prediction}{6}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Process noise}{7}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Position measurement update}{7}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Future position}{8}{subsection.2.4}%
+\contentsline {section}{\numberline {3}APF obstacle geometry}{8}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Elliptical level set}{8}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Smooth elliptical repulsion}{9}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Observed dimensions in snapshot generation}{10}{subsection.3.3}%
+\contentsline {section}{\numberline {4}APF attractive terms}{10}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Goal attraction}{10}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Path attraction}{11}{subsection.4.2}%
+\contentsline {section}{\numberline {5}CPA-based dynamic-obstacle risk}{12}{section.5}%
+\contentsline {section}{\numberline {6}COLREG encounter classification}{13}{section.6}%
+\contentsline {section}{\numberline {7}Route-entry risk and virtual obstacle corridor}{13}{section.7}%
+\contentsline {section}{\numberline {8}APF force composition and control output}{14}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Total force}{14}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Force direction and yaw-rate command}{15}{subsection.8.2}%
+\contentsline {section}{\numberline {9}Processing chain}{15}{section.9}%
+\contentsline {section}{\numberline {10}Implementation index}{16}{section.10}%
+\contentsline {section}{\numberline {A}Complete implementation source chain}{17}{appendix.A}%
+\contentsline {subsection}{\numberline {A.1}Behaviour-tree dispatch}{17}{subsection.A.1}%
+\contentsline {subsection}{\numberline {A.2}Shared COLREG and APF geometry}{18}{subsection.A.2}%
+\contentsline {subsection}{\numberline {A.3}Unified vessel, EKF, APF, and route-planning controller}{21}{subsection.A.3}%
+\contentsline {subsection}{\numberline {A.4}Crossing encounter controller}{112}{subsection.A.4}%
+\contentsline {subsection}{\numberline {A.5}Head-on encounter controller}{131}{subsection.A.5}%
+\contentsline {subsection}{\numberline {A.6}Overtaking encounter controller}{139}{subsection.A.6}%

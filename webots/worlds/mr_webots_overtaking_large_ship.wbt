@@ -55,9 +55,9 @@ webots_robot {
   supervisor TRUE
 }
 DEF FRONT_OBSTACLE_ROBOT ShipObstacle {
-  translation 2.0 -1 0.12
+  translation 3.0 -1 0.16
   rotation -1.142118617785172e-05 0.9999999999332324 1.7582952741897195e-06 0.0009182620430999692
   name "overtaking_large_ship"
-  scale 2 1.65 1.5
-  boundingSize 1.8 0.528 0.24
+  scale 3 2.2 2
+  boundingSize 2.7 0.704 0.32
 }

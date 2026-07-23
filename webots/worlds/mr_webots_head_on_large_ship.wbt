@@ -55,9 +55,9 @@ webots_robot {
   supervisor TRUE
 }
 DEF HEAD_ON_OBSTACLE_ROBOT ShipObstacle {
-  translation 6 -1 0.12
+  translation 6 -1 0.16
   rotation 0 0 1 3.14159265359
   name "head_on_large_ship"
-  scale 2 1.65 1.5
-  boundingSize 1.8 0.528 0.24
+  scale 3 2.2 2
+  boundingSize 2.7 0.704 0.32
 }

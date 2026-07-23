@@ -55,9 +55,9 @@ webots_robot {
   supervisor TRUE
 }
 DEF CROSSING_LEFT_TO_RIGHT_ROBOT ShipObstacle {
-  translation 4.8 4.67 0.12
+  translation 4.8 4.67 0.16
   rotation 0 0 1 -1.5708
   name "crossing_left_to_right_large_ship"
-  scale 2 1.65 1.5
-  boundingSize 1.8 0.528 0.24
+  scale 3 2.2 2
+  boundingSize 2.7 0.704 0.32
 }

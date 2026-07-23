@@ -1,0 +1,992 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=25mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,longtable,array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{headingblue}{HTML}{1F4D78}
+\definecolor{codebg}{HTML}{F4F6F9}
+\definecolor{codeframe}{HTML}{D5DCE5}
+\definecolor{codegreen}{HTML}{2E6B3E}
+
+\hypersetup{
+  pdftitle={APF and EKF Methods: Equations and Code Mapping},
+  pdfsubject={Artificial potential field and extended Kalman filter implementation},
+  pdfauthor={}
+}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{headingblue}\bfseries,
+  commentstyle=\color{codegreen},
+  stringstyle=\color{purple!70!black},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  framesep=5pt,
+  xleftmargin=6pt,
+  xrightmargin=6pt,
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  tabsize=4,
+  literate={×}{{$\times$}}1,
+  aboveskip=8pt,
+  belowskip=8pt
+}
+
+\setlist[itemize]{leftmargin=1.6em,itemsep=2pt,topsep=4pt}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{2}
+
+\title{\textbf{Artificial Potential Field and Extended Kalman Filter Methods}\\[4pt]
+\large Equations and Source-Code Mapping}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section*{Abbreviations and full forms}
+\addcontentsline{toc}{section}{Abbreviations and full forms}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.22\textwidth}p{0.70\textwidth}}
+\toprule
+\textbf{Symbol or term} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Symbol or term} & \textbf{Meaning} \\
+\midrule
+\endhead
+$N,E$ & Northing and easting coordinates. \\
+$G$ or $\phi$ & Vessel heading, in radians. \\
+$\Delta t$ & Discrete time step. \\
+$\bm{\mu}$ or $\bm{x}$ & State estimate. \\
+$\bm{\Sigma}$ or $\bm{P}$ & State covariance matrix. \\
+$\bm{Q},\bm{R}$ & Process-noise and measurement-noise covariance matrices. \\
+$\bm{F},\bm{H}$ & Jacobians of the state-transition and measurement functions. \\
+$\bm{z}$ & Sensor measurement. \\
+$\bm{K}$ & Kalman gain. \\
+Body frame & Vessel-fixed frame, with $x$ forward and $y$ to starboard. \\
+Earth/NE frame & Earth-fixed north--east frame. \\
+APF & Artificial Potential Field. \\
+COLREGs & International Regulations for Preventing Collisions at Sea. \\
+CPA & Closest point of approach. \\
+DBSCAN & Density-Based Spatial Clustering of Applications with Noise. \\
+TCPA, DCPA & Time to CPA and distance at CPA. \\
+EKF & Extended Kalman Filter. \\
+IMU & Inertial Measurement Unit. \\
+LiDAR & Light Detection and Ranging. \\
+PC & Principal Component. \\
+PC1 & First Principal Component. \\
+PC2 & Second Principal Component. \\
+PCA & Principal Component Analysis. \\
+\bottomrule
+\end{longtable}
+
+Angular differences are normalised to $[-\pi,\pi)$ by \texttt{wrap\_angle()}.
+
+\section{Six-state vessel EKF}
+
+In this chapter, $N$ and $E$ are northing and easting, $G$ is the vessel
+heading, and dotted quantities are their time derivatives. Bold lower-case
+letters denote vectors and bold upper-case letters denote matrices. The
+subscripts $b$ and $e$ identify the body and earth frames, respectively; $k$
+is the discrete-time index. The symbols $\Delta t$, $\bm{u}$, $\bm{x}$,
+$\bm{p}$, $\bm{v}$, and $\bm{F}$ denote the sampling interval, thruster input,
+state, position, velocity, and force. The matrices $\bm{G}$, $\bm{R}_{be}(G)$,
+and $\bm{F}$ are, respectively, the thruster allocation matrix, the rotation
+from body to earth coordinates at heading $G$, and the state-transition
+Jacobian; the bold matrix $\bm{G}$ is distinguished from the scalar heading
+$G$ by its typography. The functions $f_{\mathrm{dyn}}$ and
+$f_{\mathrm{kin}}$ are the vessel dynamics and rigid-body kinematics.
+
+\subsection{State vector and motion model}
+
+The vessel EKF uses the state vector
+\begin{equation}
+\bm{x}=
+\begin{bmatrix}
+N & E & G & \dot{N} & \dot{E} & \dot{G}
+\end{bmatrix}^{\mathsf T}.
+\end{equation}
+
+The thruster input is
+\begin{equation}
+\bm{u}=\begin{bmatrix}T_R&T_L\end{bmatrix}^{\mathsf T}.
+\end{equation}
+The allocation matrix maps the thruster forces to body-frame force and yaw moment,
+\begin{equation}
+\bm{F}_b=\bm{G}\bm{u},
+\end{equation}
+and the heading-dependent rotation maps this vector to the Earth-fixed frame,
+\begin{equation}
+\bm{F}_e=\bm{R}_{be}(G)\bm{F}_b.
+\end{equation}
+
+The vessel dynamics produce the next Earth-frame velocity,
+\begin{equation}
+\bm{v}_{e,k+1}=f_{\mathrm{dyn}}
+\left(\bm{v}_{e,k},\bm{F}_e,\Delta t\right).
+\end{equation}
+The Earth-frame velocity is transformed back to the body frame. Its surge and yaw-rate components form the kinematic input,
+\begin{equation}
+\begin{aligned}
+v &= v_b^x, &
+\omega &= v_b^G.
+\end{aligned}
+\end{equation}
+The rigid-body kinematics then update the pose,
+\begin{equation}
+\bm{p}_{k+1}=f_{\mathrm{kin}}
+\left(\bm{p}_k,[v,\omega]^{\mathsf T},\Delta t\right).
+\end{equation}
+
+The implementation is located in \texttt{motion\_model()}:
+
+\begin{lstlisting}
+Fb = self.G @ control_input
+H_eb = HomogeneousTransformation(state[N:E+1], state[G])
+Fe = H_eb.H_R @ Fb
+
+ve = self.robot.model(
+    dynamics_translation_e,
+    dynamics_rotation_e,
+    Fe,
+    state[DOTN:DOTG+1],
+    dt,
+)
+
+vb = Inverse(H_eb.H_R) @ ve
+u = Vector(2)
+u[0, 0] = vb[0, 0]
+u[1, 0] = vb[2, 0]
+
+p = rigid_body_kinematics(state[N:G+1], u, dt)
+p[2, 0] = p[2, 0] % (2 * np.pi)
+\end{lstlisting}
+
+\subsection{State-transition Jacobian}
+
+The implementation uses a first-order discrete-time Jacobian. Here
+$\bm{F}_k$ is the Jacobian of the transition function at time $k$, and the
+unit entries preserve direct integration of northing, easting, and heading
+from their corresponding rates:
+\begin{equation}
+\bm{F}=
+\begin{bmatrix}
+1 & 0 & 0 & \Delta t & 0 & 0 \\
+0 & 1 & 0 & 0 & \Delta t & 0 \\
+0 & 0 & 1 & 0 & 0 & \Delta t \\
+0 & 0 & 0 & 1 & 0 & 0 \\
+0 & 0 & 0 & 0 & 1 & 0 \\
+0 & 0 & 0 & 0 & 0 & 1
+\end{bmatrix}.
+\end{equation}
+
+\begin{lstlisting}
+F = Identity(6)
+F[N, DOTN] = dt
+F[E, DOTE] = dt
+F[G, DOTG] = dt
+\end{lstlisting}
+
+\subsection{Prediction step}
+
+The symbols $\hat{\bm{x}}_k$ and $\hat{\bm{\Sigma}}_k$ denote the predicted
+state and covariance, while $\bm{x}_{k-1}$ and $\bm{\Sigma}_{k-1}$ are the
+previous corrected state and covariance. The transition function is $f$,
+$\bm{Q}_k$ is the process-noise covariance, and the superscript $\mathsf T$
+denotes matrix transpose. The state and covariance predictions are
+\begin{align}
+\hat{\bm{x}}_k &= f(\bm{x}_{k-1},\bm{u}_k,\Delta t),\\
+\hat{\bm{\Sigma}}_k
+&=\bm{F}_k\bm{\Sigma}_{k-1}\bm{F}_k^{\mathsf T}+\bm{Q}_k.
+\end{align}
+
+\begin{lstlisting}
+def extended_kalman_filter_predict(mu, Sigma, u, f, Q, dt):
+    pred_mu, F = f(mu, u, dt)
+    pred_Sigma = F @ Sigma @ F.T + Q
+    return pred_mu, pred_Sigma
+\end{lstlisting}
+
+\subsection{Pose and yaw-rate measurement models}
+
+The measurement vector is $\bm{z}$, and $h_{\mathrm{pose}}$ is the pose
+measurement function. The matrix $\bm{H}$ is its measurement Jacobian. The
+scalar $z_{\mathrm{gyro}}$ is the measured yaw rate, and
+$H_{\mathrm{gyro}}$ is the corresponding Jacobian entry. The ArUco measurement
+contains northing, easting, and heading:
+\begin{equation}
+\bm{z}_{\mathrm{pose}}=h_{\mathrm{pose}}(\bm{x})
+=\begin{bmatrix}N&E&G&0&0&0\end{bmatrix}^{\mathsf T}.
+\end{equation}
+Its Jacobian has unit entries at $(N,N)$, $(E,E)$, and $(G,G)$. The IMU model measures yaw rate:
+\begin{equation}
+\begin{aligned}
+z_{\mathrm{gyro}} &= \dot G, &
+H_{\mathrm{gyro}}[\dot G,\dot G] &= 1.
+\end{aligned}
+\end{equation}
+
+\begin{lstlisting}
+def h_pose_update(x):
+    est_measurement = Vector(6)
+    est_measurement[N] = x[N]
+    est_measurement[E] = x[E]
+    est_measurement[G] = x[G]
+    H = Matrix(6, 6)
+    H[N, N] = 1
+    H[E, E] = 1
+    H[G, G] = 1
+    return est_measurement, H
+
+def h_grate_update(x):
+    est_measurement = Vector(6)
+    est_measurement[DOTG] = x[DOTG]
+    H = Matrix(6, 6)
+    H[DOTG, DOTG] = 1
+    return est_measurement, H
+\end{lstlisting}
+
+\subsection{Measurement update}
+
+In this subsection, $\hat{\bm{z}}$ is the predicted measurement, $\bm{y}$ is
+the innovation, $\bm{S}$ is the innovation covariance, and $\bm{K}$ is the
+Kalman gain. Superscripts $-$ and $+$ identify the predicted and corrected
+quantities. The matrix $\bm{I}$ is the identity matrix, and $\bm{R}$ is the
+measurement-noise covariance. The predicted measurement, innovation,
+innovation covariance, and Kalman gain are
+\begin{align}
+\hat{\bm{z}}&=h(\hat{\bm{x}}),\\
+\bm{y}&=\bm{z}-\hat{\bm{z}},\\
+\bm{S}&=\bm{H}\bm{\Sigma}^{-}\bm{H}^{\mathsf T}+\bm{R},\\
+\bm{K}&=\bm{\Sigma}^{-}\bm{H}^{\mathsf T}\bm{S}^{-1}.
+\end{align}
+The corrected state is
+\begin{equation}
+\bm{x}^{+}=\bm{x}^{-}+\bm{K}\bm{y}.
+\end{equation}
+The heading innovation is wrapped before correction:
+\begin{equation}
+y_G=\operatorname{wrap}(z_G-\hat z_G).
+\end{equation}
+The vessel EKF currently updates the covariance as
+\begin{equation}
+\bm{\Sigma}^{+}=(\bm{I}-\bm{K}\bm{H})\bm{\Sigma}^{-}.
+\end{equation}
+
+\begin{lstlisting}
+def extended_kalman_filter_update(
+    mu, Sigma, z, h, R, wrap_index=None
+):
+    pred_z, H = h(mu)
+    K = Sigma @ H.T @ Inverse(H @ Sigma @ H.T + R)
+    delta_z = z - pred_z
+    if wrap_index is not None:
+        delta_z[wrap_index] = (
+            delta_z[wrap_index] + np.pi
+        ) % (2 * np.pi) - np.pi
+    cor_mu = mu + K @ delta_z
+    cor_Sigma = (Identity(mu.shape[0]) - K @ H) @ Sigma
+    return cor_mu, cor_Sigma
+\end{lstlisting}
+
+In the main loop, the update order is thruster-based prediction, ArUco pose correction, and IMU yaw-rate correction.
+
+\section{Four-state obstacle constant-velocity EKF}
+
+The obstacle EKF contains no yaw, heading, or turn-rate state. At prediction
+index $k$, it estimates northing $p_N$, easting $p_E$, and their corresponding
+earth-frame velocities $v_N$ and $v_E$. The symbol $\Delta t$ denotes the
+prediction interval; $\bm{F}$, $\bm{Q}$, $\bm{H}$, $\bm{R}$, $\bm{P}$, and
+$\bm{K}$ denote the state-transition, process-noise, measurement, measurement-
+noise, covariance, and Kalman-gain matrices respectively.
+
+\subsection{State vector and constant-velocity prediction}
+
+Each tracked obstacle uses the four-state vector
+\begin{equation}
+\bm{x}=
+\begin{bmatrix}p_N&p_E&v_N&v_E\end{bmatrix}^{\mathsf T}.
+\end{equation}
+Its constant-velocity transition is
+\begin{equation}
+\bm{x}_{k+1}=\bm{F}\bm{x}_k,\qquad
+\bm{F}=\begin{bmatrix}
+1&0&\Delta t&0\\
+0&1&0&\Delta t\\
+0&0&1&0\\
+0&0&0&1
+\end{bmatrix}.
+\end{equation}
+
+\begin{lstlisting}
+state = np.asarray(state, dtype=float).reshape(4)
+covariance = np.asarray(covariance, dtype=float).reshape(4, 4)
+F = np.array([
+    [1.0, 0.0, dt, 0.0],
+    [0.0, 1.0, 0.0, dt],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+], dtype=float)
+predicted_state = F @ state
+predicted_covariance = F @ covariance @ F.T + self.obstacle_ekf_process_noise(dt)
+\end{lstlisting}
+
+The direction used to orient a predicted APF ellipse is derived from the
+estimated velocity vector when its magnitude is non-zero; it is not stored or
+filtered as an additional yaw state.
+
+\subsection{Process noise}
+
+The process covariance assumes white acceleration with standard deviation
+$\sigma_a$. With $q=\sigma_a^2$, the implemented covariance is
+\begin{equation}
+\bm{Q}=q\begin{bmatrix}
+\frac{\Delta t^4}{4}&0&\frac{\Delta t^3}{2}&0\\
+0&\frac{\Delta t^4}{4}&0&\frac{\Delta t^3}{2}\\
+\frac{\Delta t^3}{2}&0&\Delta t^2&0\\
+0&\frac{\Delta t^3}{2}&0&\Delta t^2
+\end{bmatrix}.
+\end{equation}
+
+\begin{lstlisting}
+q = self.obstacle_ekf_accel_std_m_s2 ** 2
+dt2, dt3, dt4 = dt * dt, dt * dt * dt, (dt * dt) ** 2
+return q * np.array([
+    [0.25 * dt4, 0.0, 0.5 * dt3, 0.0],
+    [0.0, 0.25 * dt4, 0.0, 0.5 * dt3],
+    [0.5 * dt3, 0.0, dt2, 0.0],
+    [0.0, 0.5 * dt3, 0.0, dt2],
+], dtype=float)
+\end{lstlisting}
+
+\subsection{Position measurement update}
+
+LiDAR supplies the two-dimensional obstacle position,
+\begin{equation}
+\bm{z}=\begin{bmatrix}p_N^{\mathrm{meas}}&p_E^{\mathrm{meas}}\end{bmatrix}^{\mathsf T},
+\qquad
+\bm{H}=\begin{bmatrix}1&0&0&0\\0&1&0&0\end{bmatrix}.
+\end{equation}
+The correction uses the innovation $\bm{\nu}=\bm{z}-\bm{H}\bm{x}^{-}$ and
+the Joseph covariance form,
+\begin{align}
+\bm{S}&=\bm{H}\bm{P}^{-}\bm{H}^{\mathsf T}+\bm{R}, &
+\bm{K}&=\bm{P}^{-}\bm{H}^{\mathsf T}\bm{S}^{-1},\\
+\bm{x}^{+}&=\bm{x}^{-}+\bm{K}\bm{\nu}, &
+\bm{P}^{+}&=(\bm{I}-\bm{K}\bm{H})\bm{P}^{-}(\bm{I}-\bm{K}\bm{H})^{\mathsf T}
++\bm{K}\bm{R}\bm{K}^{\mathsf T}.
+\end{align}
+
+\begin{lstlisting}
+H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+innovation = measurement_ne - H @ state
+innovation_covariance = H @ covariance @ H.T + R_obs
+try:
+    kalman_gain = covariance @ H.T @ np.linalg.inv(innovation_covariance)
+except np.linalg.LinAlgError:
+    kalman_gain = covariance @ H.T @ np.linalg.pinv(innovation_covariance)
+corrected_state = state + kalman_gain @ innovation
+correction = np.eye(4) - kalman_gain @ H
+corrected_covariance = correction @ covariance @ correction.T + kalman_gain @ R_obs @ kalman_gain.T
+\end{lstlisting}
+
+The vessel's own yaw uncertainty can enlarge $\bm{R}$ because it rotates a
+LiDAR measurement into the earth frame. This is a measurement-uncertainty
+term only; it does not introduce yaw into the four-state obstacle EKF.
+
+\subsection{Future position}
+
+For a horizon $\tau\geq0$, the code propagates a track with
+\begin{equation}
+\bm{p}(\tau)=\begin{bmatrix}p_N&p_E\end{bmatrix}^{\mathsf T}
++\tau\begin{bmatrix}v_N&v_E\end{bmatrix}^{\mathsf T}.
+\end{equation}
+
+\begin{lstlisting}
+state = np.asarray(track.get("state", [np.nan] * 4), dtype=float).reshape(4)
+position_ne = state[:2]
+velocity_ne = state[2:4]
+return position_ne + velocity_ne * max(float(dt_s), 0.0), velocity_ne.copy()
+\end{lstlisting}
+
+\section{APF obstacle geometry}
+
+In this chapter, $\bm{r}$ is the relative position from the obstacle centre
+to the vessel, while $\bm{l}$ and $\bm{w}$ are orthogonal unit vectors along
+the obstacle length and width. The observed principal-component dimensions
+$pc1$ and $pc2$ define the corresponding semi-axes $a_0$ and $b_0$. The
+scalars $a$ and $b$ are the projections of $\bm{r}$ onto these axes, $\rho$
+is the dimensionless elliptical level, $\bm{g}$ is the outward gradient,
+and $\hat{\bm{d}}$ is its unit direction. The scalar $s$ is the outer field
+scale, $u$ is the normalised decay coordinate, $f_{\mathrm{fade}}$ is the
+smooth fade factor, $k_{\mathrm{rep}}$ is the repulsive gain, and
+$\bm{F}_{\mathrm{rep}}$ is the resulting repulsive force. A hat denotes a
+unit vector, $\lVert\cdot\rVert$ denotes Euclidean norm, and $\cdot$ denotes
+the inner product.
+
+\subsection{Elliptical level set}
+
+The measured obstacle dimensions $pc1$ and $pc2$ are obtained from the first
+and second principal components of the clustered LiDAR points. The axial
+projections are
+\begin{equation}
+\begin{aligned}
+a &= \bm{r}\cdot\bm{l}, &
+b &= \bm{r}\cdot\bm{w}.
+\end{aligned}
+\end{equation}
+The APF semi-axes are defined from the observed dimensions and enlarged by
+the own-vessel equivalent radius $r_{\mathrm{own}}$:
+\begin{equation}
+\begin{aligned}
+a_0 &= \frac{pc1}{2}+r_{\mathrm{own}}, &
+b_0 &= \frac{pc2}{2}+r_{\mathrm{own}}.
+\end{aligned}
+\end{equation}
+Minimum PC dimensions are used only when an observation is invalid or unavailable.
+The elliptical level is
+\begin{equation}
+\rho=\sqrt{\left(\frac{a}{a_0}\right)^2+
+\left(\frac{b}{b_0}\right)^2}.
+\end{equation}
+The outward gradient and corresponding unit direction are
+\begin{align}
+\bm{g}&=\frac{a}{a_0^2}\bm{l}+\frac{b}{b_0^2}\bm{w},\\
+\hat{\bm{d}}&=\frac{\bm{g}}{\lVert\bm{g}\rVert}.
+\end{align}
+
+The condition $\rho<1$ indicates that the vessel has entered the observed
+obstacle boundary. The repulsive field is inactive when $\rho\geq s$.
+
+\begin{lstlisting}
+pc1_m, pc2_m = self.obstacle_pc_dimensions(obstacle)
+semi_length_m = 0.5 * pc1_m + self.apf_own_equivalent_radius_m
+semi_width_m = 0.5 * pc2_m + self.apf_own_equivalent_radius_m
+
+along = float(np.dot(offset, length_axis))
+across = float(np.dot(offset, width_axis))
+level = float(np.hypot(
+    along / semi_length_m,
+    across / semi_width_m,
+))
+gradient = (
+    along / (semi_length_m * semi_length_m) * length_axis
+    + across / (semi_width_m * semi_width_m) * width_axis
+)
+away = gradient / np.linalg.norm(gradient)
+\end{lstlisting}
+
+\subsection{Smooth elliptical repulsion}
+
+For $s>1$, the implementation applies a cubic smoothstep decay. The variable
+$u$ clips the level interval $[1,s]$ to $[0,1]$, so that the fade remains
+bounded both inside the obstacle and outside the influence region:
+\begin{align}
+u&=\operatorname{clip}\left(\frac{\rho-1}{s-1},0,1\right),\\
+f_{\mathrm{fade}}&=1-(3u^2-2u^3),\\
+\bm{F}_{\mathrm{rep}}&=k_{\mathrm{rep}}f_{\mathrm{fade}}\hat{\bm{d}}.
+\end{align}
+The force is maximal at and inside $\rho=1$, and it decreases smoothly to zero at $\rho=s$. To retain the measured size information in the force magnitude, the implementation scales the gain by the square root of the PCA footprint, while clipping the multiplier to a bounded range:
+\begin{equation}
+k_{\mathrm{eff}}=k_{\mathrm{rep}}\operatorname{clip}
+\left(\sqrt{pc1\,pc2},0.5,2.0\right).
+\end{equation}
+
+\begin{lstlisting}
+u = np.clip(
+    (level - 1.0) / (outer_scale - 1.0),
+    0.0,
+    1.0,
+)
+fade = 1.0 - (3.0 * u * u - 2.0 * u * u * u)
+return gain * fade * np.asarray(away).reshape(2), True
+\end{lstlisting}
+
+The corresponding controller code evaluates the ellipse at the actual
+measured or virtual-field position. Hence DCPA remains a diagnostic quantity;
+it is not treated as a second force location.
+
+\begin{lstlisting}
+level, away = ellipse_level_and_away(
+    -centre_body, axis_body,
+    0.5 * pc1_m + self.apf_own_equivalent_radius_m,
+    0.5 * pc2_m + self.apf_own_equivalent_radius_m,
+)
+if level >= outer_scale:
+    return np.zeros(2, dtype=float), False
+size_gain = np.sqrt(max(pc1_m * pc2_m, 1e-6))
+gain = self.apf_repulsive_gain * np.clip(size_gain, 0.5, 2.0)
+return smooth_ellipse_repulsion(level, away, gain, outer_scale)
+\end{lstlisting}
+
+The project uses two fields with this form. The first is centred on the current LiDAR obstacle, while the second is centred on the EKF/CPA-predicted obstacle. Their outer scales are selected from encounter-specific profiles: head-on, overtaking, crossing, and static-obstacle cases. Predicted fields use a separate profile table from current-observation fields.
+
+\subsection{Observed dimensions in snapshot generation}
+
+The offline potential-field renderer uses the same observed $pc1$ and $pc2$ dimensions. The stored equivalent radius is not used to reconstruct the obstacle dimensions when these observations are present; fallback values are the configured minimum PC dimensions.
+
+\begin{lstlisting}
+pc1_m = positive(obstacle.get("pc1_m"), minimum_pc1_m)
+pc2_m = positive(obstacle.get("pc2_m"), minimum_pc2_m)
+return max(pc1_m, minimum_pc1_m), max(
+    min(pc2_m, pc1_m), minimum_pc2_m
+)
+\end{lstlisting}
+
+\section{APF attractive terms}
+
+In this chapter, all attractive-force vectors are expressed in the vessel body
+frame. The target vector is $\bm{t}$, its distance is $d$, $k_g$ is the goal
+gain, and $d_{\mathrm{sat}}$ is the maximum distance used for saturating the
+goal-force magnitude. The path variables $\bm{s}$, $\bm{g}$, $\bm{p}$,
+$\bm{d}_{\mathrm{path}}$, $L_{\mathrm{path}}$, $\lambda$, and
+$\bm{p}_{\mathrm{path}}$ denote the start, goal, current position, route
+vector, route length, clipped projection coefficient, and selected route
+point. The transformation $T_{\mathrm{earth}\rightarrow\mathrm{body}}$
+maps earth-frame vectors into body-frame vectors. The path error and its norm
+are $\bm{e}_{\mathrm{path}}$ and $d_{\mathrm{path}}$; $k_p$ is the path gain,
+and $d_{\mathrm{threshold}}$ is the path dead-band threshold. Finally,
+$\bm{F}_{\mathrm{goal}}$, $\bm{F}_{\mathrm{path}}$, and
+$\bm{F}_{\mathrm{att}}$ denote the goal, path, and total attractive forces.
+
+\subsection{Goal attraction}
+
+Let $\bm{t}$ be the target position in the body frame, with
+$d=\lVert\bm{t}\rVert$. The saturated goal-attraction term is
+\begin{equation}
+\bm{F}_{\mathrm{goal}}=k_g\min(d,d_{\mathrm{sat}})\frac{\bm{t}}{d}.
+\end{equation}
+
+\begin{lstlisting}
+distance_m = float(np.linalg.norm(target_body))
+magnitude = self.apf_goal_gain * min(
+    distance_m,
+    self.apf_attraction_saturation_m,
+)
+goal_force = magnitude * target_body / distance_m
+\end{lstlisting}
+
+\subsection{Path attraction}
+
+The path-attraction field keeps the vessel close to the straight route from the
+initial position to the goal. Let $\bm{s}$ and $\bm{g}$ denote the start and
+goal positions in the north--east frame, and let $\bm{p}$ be the current vessel
+position. The route vector and its squared length are
+\begin{equation}
+\begin{aligned}
+\bm{d}_{\mathrm{path}} &= \bm{g}-\bm{s},\\
+L_{\mathrm{path}}^2 &= \bm{d}_{\mathrm{path}}^{\mathsf T}
+\bm{d}_{\mathrm{path}}.
+\end{aligned}
+\end{equation}
+If $L_{\mathrm{path}}^2$ is smaller than a numerical tolerance, the start and
+goal are treated as coincident and the path-attraction force is set to zero.
+
+For a valid route, the projection coefficient of the current position onto the
+start-to-goal segment is
+\begin{equation}
+\lambda^{*}=
+\frac{(\bm{p}-\bm{s})^{\mathsf T}\bm{d}_{\mathrm{path}}}
+{L_{\mathrm{path}}^2}.
+\end{equation}
+The implementation clips this coefficient to $[0,1]$:
+\begin{equation}
+\lambda=\operatorname{clip}(\lambda^{*},0,1).
+\end{equation}
+Consequently, the reference point is on the finite route segment rather than
+on its infinite extension,
+\begin{equation}
+\bm{p}_{\mathrm{path}}=\bm{s}+\lambda\bm{d}_{\mathrm{path}}.
+\end{equation}
+When the perpendicular projection falls before the start or beyond the goal,
+the start or goal endpoint is therefore used as the reference point.
+
+The vector from the vessel to this reference point is first calculated in the
+north--east frame and then transformed into the vessel body frame. With
+$T_{\mathrm{earth}\rightarrow\mathrm{body}}$ denoting the rotation from the
+earth frame to the body frame,
+\begin{equation}
+\bm{e}_{\mathrm{path}}=
+T_{\mathrm{earth}\rightarrow\mathrm{body}}
+(\bm{p}_{\mathrm{path}}-\bm{p}).
+\end{equation}
+The norm $d_{\mathrm{path}}=\lVert\bm{e}_{\mathrm{path}}\rVert$ is the current
+cross-track distance to the selected route point. The resulting path force is
+\begin{equation}
+\bm{F}_{\mathrm{path}}=
+\begin{cases}
+\bm{0}, & d_{\mathrm{path}}<d_{\mathrm{threshold}},\\
+k_p\bm{e}_{\mathrm{path}}, & d_{\mathrm{path}}\geq d_{\mathrm{threshold}}.
+\end{cases}
+\end{equation}
+The dead-band threshold prevents small position-estimation fluctuations from
+causing continuous corrective commands while the vessel is already close to
+the route. Outside this band, the force magnitude is proportional to the
+cross-track error and its direction points toward the route.
+
+\begin{lstlisting}
+path_vec = self.goal_ne - self.start_ne
+path_len_sq = float(np.dot(path_vec, path_vec))
+if path_len_sq < 1e-9:
+    return np.zeros(2, dtype=float)
+
+current_ne = np.array(
+    [float(self.North), float(self.East)], dtype=float
+)
+ratio = float(np.clip(
+    np.dot(current_ne - self.start_ne, path_vec)
+    / path_len_sq,
+    0.0,
+    1.0,
+))
+closest_ne = self.start_ne + ratio * path_vec
+to_path_body = self.earth_point_to_body(closest_ne)
+distance_m = float(np.linalg.norm(to_path_body))
+
+if distance_m < self.apf_path_threshold_m or distance_m < 1e-6:
+    return np.zeros(2, dtype=float)
+return self.apf_path_gain * to_path_body
+\end{lstlisting}
+
+The total attractive term is the vector sum of the two components:
+\begin{equation}
+\bm{F}_{\mathrm{att}}=
+\bm{F}_{\mathrm{goal}}+\bm{F}_{\mathrm{path}}.
+\end{equation}
+
+\section{CPA-based dynamic-obstacle risk}
+
+In this chapter, $\bm{p}$ is the obstacle position relative to the vessel,
+$\bm{v}_{\mathrm{obs}}$ and $\bm{v}_{\mathrm{own}}$ are the obstacle and own-
+vessel velocities, and $\bm{v}_{\mathrm{rel}}$ is their relative velocity.
+$\mathrm{TCPA}$ is the non-negative time to the closest point of approach,
+and $\mathrm{DCPA}$ is the distance at that time. The symbols $\bm{p}(t)$ and
+$\bm{v}_{\mathrm{rel}}$ describe relative position and velocity, while
+$\lVert\cdot\rVert$ denotes vector magnitude. The zero-speed threshold is a
+numerical guard used when the relative-velocity norm is too small.
+
+The relative velocity is
+\begin{equation}
+\bm{v}_{\mathrm{rel}}=\bm{v}_{\mathrm{obs}}-\bm{v}_{\mathrm{own}}.
+\end{equation}
+If $\lVert\bm{v}_{\mathrm{rel}}\rVert^2$ is sufficiently small, the implementation returns
+\begin{equation}
+\begin{aligned}
+\mathrm{TCPA} &= \infty, &
+\mathrm{DCPA} &= \lVert\bm{p}\rVert.
+\end{aligned}
+\end{equation}
+Otherwise,
+\begin{align}
+\mathrm{TCPA}&=\max\left(
+-\frac{\bm{p}\cdot\bm{v}_{\mathrm{rel}}}
+{\lVert\bm{v}_{\mathrm{rel}}\rVert^2},0\right),\\
+\mathrm{DCPA}&=\left\lVert
+\bm{p}+\bm{v}_{\mathrm{rel}}\mathrm{TCPA}
+\right\rVert.
+\end{align}
+
+\begin{lstlisting}
+rel_vel = obs_vel_body - own_vel_body
+rel_speed_sq = float(np.dot(rel_vel, rel_vel))
+
+if rel_speed_sq < 1e-9:
+    return np.inf, float(np.linalg.norm(obs_pos_body))
+
+tcpa = max(
+    -float(np.dot(obs_pos_body, rel_vel)) / rel_speed_sq,
+    0.0,
+)
+dcpa = float(np.linalg.norm(
+    obs_pos_body + rel_vel * tcpa
+))
+return tcpa, dcpa
+\end{lstlisting}
+
+\section{COLREG encounter classification}
+
+The encounter classifier first uses the obstacle bearing in the vessel frame,
+then tests the obstacle course and the speed relation. The sectors are
+``ahead'' ($[-67.5^\circ,67.5^\circ)$), port, starboard, and astern. A
+head-on encounter is accepted only when an ahead obstacle has a reciprocal
+course. Overtaking is deliberately stricter: it requires a narrow ahead
+sector, an approximately common course, a verified stern-side geometry, and
+an own-vessel speed exceeding the obstacle speed. This avoids temporarily
+misclassifying a crossing vessel as an overtaking vessel when a track jitters
+near a sector boundary.
+
+\begin{lstlisting}
+if head_on_ahead and head_on_reciprocal:
+    return "head_on", -1.0, "COLREG Rule 14: both alter to starboard"
+
+if ahead and (
+    speed_known and overtaking_ahead and overtaking_same_course
+    and own_in_obstacle_stern_sector
+    and own_speed_m_s > obstacle_speed_m_s + 0.08
+    and obstacle_lateral_speed_m_s <= 0.06
+):
+    return "overtaking", -1.0, "COLREG Rule 13: overtake on starboard side"
+
+if on_starboard:
+    return ("crossing_from_starboard", -1.0,
+            "COLREG Rule 15: give way, pass astern")
+\end{lstlisting}
+
+For Rule~13, the controller uses a short-horizon EKF prediction only when the
+track is stable and its heading uncertainty is below the configured bound.
+Rule~14 may use the measured direction before this confirmation so that an
+approaching vessel is not missed during track initialisation.
+
+\section{Route-entry risk and virtual obstacle corridor}
+
+The controller does not create a single virtual field at DCPA. For every
+stable dynamic EKF track with $0<\mathrm{TCPA}\leq T_{\mathrm{horizon}}$, it
+places the final virtual field at $2\,\mathrm{TCPA}$ and fills the interval
+from the current track position to that field with overlapping ellipses. The
+bridge turns the predicted motion into a continuous exclusion corridor,
+allowing route planning to respond before reaching the closest-approach point.
+The final field centre is
+\begin{equation}
+\bm{p}_{\mathrm{virtual}}=
+\bm{p}_{\mathrm{obs}}+2\,\mathrm{TCPA}\,\bm{v}_{\mathrm{obs}}.
+\end{equation}
+
+The route-entry check maps the line segment into the ellipse coordinate
+system. With $\bm{q}_0$ and $\bm{q}_1$ denoting the normalised start offset
+and direction, the route is unsafe when
+\begin{equation}
+\min_{0\leq\lambda\leq1}\lVert\bm{q}_0+\lambda\bm{q}_1\rVert\leq1.
+\end{equation}
+
+\begin{lstlisting}
+final_ne = start_ne + velocity_ne * (2.0 * tcpa_s)
+bridge_count = max(int(np.ceil(
+    np.linalg.norm(final_ne - start_ne) / max_gap_m
+)) - 1, 0)
+for index in range(1, bridge_count + 1):
+    self.apf_virtual_obstacles.append(field(
+        start_ne + (final_ne - start_ne) * index / (bridge_count + 1),
+        bridge=True,
+    ))
+self.apf_virtual_obstacles.append(field(final_ne))
+\end{lstlisting}
+
+\begin{lstlisting}
+axis /= axis_norm
+lateral = np.array([-axis[1], axis[0]])
+scale = np.array([half_long_m + margin_m, half_lateral_m + margin_m])
+offset = np.array([np.dot(start-centre, axis), np.dot(start-centre, lateral)]) / scale
+direction = np.array([np.dot(end-start, axis), np.dot(end-start, lateral)]) / scale
+denominator = float(np.dot(direction, direction))
+alpha = 0.0 if denominator < 1e-12 else float(np.clip(
+    -np.dot(offset, direction) / denominator, 0.0, 1.0
+))
+return np.linalg.norm(offset + alpha * direction) <= 1.0
+\end{lstlisting}
+
+\section{APF force composition and control output}
+
+In this chapter, $\bm{F}$ is the total body-frame guidance force,
+$\bm{F}_{\mathrm{att}}$ is the attractive force, and
+$\bm{F}_{\mathrm{rep}}$ is the accumulated repulsive force. When a COLREG
+side is locked, $\bm{F}_{\mathrm{offset}}$ pulls the temporary target to that
+side of the main route. In the steering equations,
+$F_x$ and $F_y$ are the forward and lateral components of $\bm{F}$,
+$\theta_F$ is its steering angle, $k_h$ is the heading gain, $\omega_c$ is
+the commanded yaw rate, and $\omega_{\max}$ is its magnitude limit. The
+operator $\operatorname{atan2}$ returns the signed angle from the two force
+components, while $\operatorname{clip}$ limits a scalar to a prescribed
+interval. The final command contains surge speed $v_c$ and yaw rate
+$\omega_c$.
+
+\subsection{Total force}
+
+The controller sums the attractive force and the repulsive contributions:
+\begin{equation}
+\bm{F}=\bm{F}_{\mathrm{att}}+\sum_i\bm{F}_{\mathrm{rep},i}.
+\end{equation}
+When a COLREG side is locked, the route look-ahead target is shifted by the
+required clearance in the selected route normal direction and contributes an
+additional attractive term,
+\begin{equation}
+\bm{F}\leftarrow\bm{F}+\bm{F}_{\mathrm{offset}}.
+\end{equation}
+
+If an active field would make the forward component non-positive, the steering
+vector is repaired with a small positive forward component and a lateral sign
+consistent with the locked avoidance side. This preserves turning authority
+without reversing the vessel.
+
+\begin{lstlisting}
+force_body = attractive_force + repulsive_force
+if any_repulsion and self.apf_side_lock_sign != 0.0:
+    offset_target_ne = target_ne + (
+        self.apf_side_lock_sign * clearance_offset_m * route_normal_left_ne
+    )
+    offset_target_body = self.earth_point_to_body(offset_target_ne)
+    offset_force = self.apf_clearance_gain * (
+        offset_target_body / max(np.linalg.norm(offset_target_body), 1e-6)
+    )
+    force_body += offset_force
+
+if any_repulsion and force_body[0] <= 0.0:
+    steering_force[1] = side_sign * max(abs(force_body[1]), 0.20)
+    steering_force[0] = max(0.25 * abs(steering_force[1]), 0.05)
+\end{lstlisting}
+
+The controller also preserves the COLREGs-selected avoidance side. If the forward force becomes non-positive, it retains a lateral component and inserts a small positive forward component.
+
+\subsection{Force direction and yaw-rate command}
+
+The steering angle is
+\begin{equation}
+\theta_F=\operatorname{atan2}(F_y,F_x).
+\end{equation}
+After limiting this angle, the yaw-rate command is
+\begin{equation}
+\omega_c=\operatorname{clip}\left(
+-\frac{k_h\theta_F}{\Delta t},
+-\omega_{\max},\omega_{\max}
+\right).
+\end{equation}
+
+\begin{lstlisting}
+force_angle = np.arctan2(
+    steering_force[1], steering_force[0]
+)
+force_angle = np.clip(
+    force_angle,
+    -self.apf_heading_step_limit_rad,
+    self.apf_heading_step_limit_rad,
+)
+u_cmd[1, 0] = np.clip(
+    -self.apf_heading_gain * force_angle
+    / max(self.lastdt, 1e-3),
+    -self.w_max,
+    self.w_max,
+)
+\end{lstlisting}
+
+During APF avoidance, the force magnitude does not directly determine surge
+speed. The active encounter profile supplies a conservative descent speed,
+and a close overtaking manoeuvre can further reduce it while retaining the
+minimum turning angle:
+
+\begin{lstlisting}
+surge_speed = float(active_params.get(
+    "constant_descent_speed_m_s",
+    self.apf_constant_descent_speed_m_s,
+))
+force_angle, surge_speed = self.apf_overtaking_close_turn_command(
+    primary_encounter,
+    nearest_obstacle_distance_m,
+    force_angle,
+    surge_speed,
+)
+u_cmd[0, 0] = float(np.clip(surge_speed, 0.0, self.v_max))
+\end{lstlisting}
+
+The final APF control output is
+\begin{equation}
+\bm{u}_{\mathrm{APF}}=
+\begin{bmatrix}v_c&\omega_c\end{bmatrix}^{\mathsf T}.
+\end{equation}
+
+\section{Processing chain}
+
+The complete processing chain is:
+\begin{enumerate}
+  \item cluster the LiDAR point cloud using DBSCAN and estimate obstacle dimensions using PCA;
+  \item associate detections with obstacle tracks;
+  \item predict and correct each obstacle state with the four-state constant-velocity EKF;
+  \item compute obstacle velocity, TCPA, DCPA, and future positions;
+  \item classify the encounter using the COLREG bearing, course, and speed tests;
+  \item construct the current field and the EKF 2$\times$TCPA virtual-field corridor;
+  \item reject route segments entering an APF ellipse and combine APF attraction, repulsion, and the locked COLREG side constraint;
+  \item convert the resultant-force direction into surge and yaw-rate commands; and
+  \item allocate the commanded force and moment to the two thrusters.
+\end{enumerate}
+
+The vessel EKF supplies the vessel position, heading, and velocity at the start of this chain. The obstacle EKF supplies the predicted dynamic-obstacle state used by the APF.
+
+\section{Implementation index}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.39\textwidth}p{0.53\textwidth}}
+\toprule
+\textbf{Function} & \textbf{Source-code entry point} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Function} & \textbf{Source-code entry point} \\
+\midrule
+\endhead
+Vessel motion model & \texttt{motion\_model} \\
+Vessel EKF prediction & \texttt{extended\_kalman\_filter\_predict} \\
+Vessel EKF update & \texttt{extended\_kalman\_filter\_update} \\
+Pose measurement model & \texttt{h\_pose\_update} \\
+Yaw-rate measurement model & \texttt{h\_grate\_update} \\
+Obstacle CV propagation & \texttt{obstacle\_ekf\_predict} \\
+Obstacle EKF process noise & \texttt{obstacle\_ekf\_process\_noise} \\
+Obstacle EKF measurement update & \texttt{obstacle\_ekf\_update} \\
+Elliptical geometry & \texttt{ellipse\_level\_and\_away} \\
+Smooth elliptical repulsion & \texttt{smooth\_ellipse\_repulsion} \\
+Goal and path attraction & \texttt{apf\_goal\_attraction\_body}, \texttt{apf\_path\_attraction\_body} \\
+CPA computation & \texttt{apf\_cpa\_metrics} \\
+COLREG zone classification & \texttt{classify\_colreg\_zone}, \texttt{apf\_classify\_encounter} \\
+Virtual-field corridor & \texttt{update\_apf\_virtual\_obstacles} \\
+Route--ellipse intersection & \texttt{segment\_intersects\_ellipse} \\
+Obstacle repulsion composition & \texttt{apf\_repulsion\_for\_obstacle} \\
+APF control output & \texttt{compute\_apf\_control} \\
+\bottomrule
+\end{longtable}
+
+\clearpage
+\appendix
+\section{Complete implementation source chain}
+
+The preceding code blocks identify the relevant operations next to their
+equations. This appendix embeds the complete current definitions without
+elision. Together, these files contain the implementation chain for every
+method indexed above: the behaviour-tree dispatch, COLREG classification,
+shared APF geometry, the unified controller, and the three encounter-specific
+controllers.
+
+\subsection{Behaviour-tree dispatch}
+\lstinputlisting{../src/behavior_tree.py}
+
+\subsection{Shared COLREG and APF geometry}
+\lstinputlisting{../src/colreg_apf.py}
+
+\subsection{Unified vessel, EKF, APF, and route-planning controller}
+\lstinputlisting{../src/laptop.py}
+
+\subsection{Crossing encounter controller}
+\lstinputlisting{../src/laptop-crossing.py}
+
+\subsection{Head-on encounter controller}
+\lstinputlisting{../src/laptop-headon.py}
+
+\subsection{Overtaking encounter controller}
+\lstinputlisting{../src/laptop-overtaking.py}
+
+\end{document}
