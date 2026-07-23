@@ -16,7 +16,7 @@ import subprocess
 import platform
 import copy
 
-from colreg_apf import constrain_velocity_to_axis, smooth_undirected_axis, straight_line_cpa
+from colreg_apf import constrain_velocity_to_axis, merge_collinear_cluster_labels, smooth_undirected_axis, straight_line_cpa
 
 from zeroros import Publisher, Subscriber
 from zeroros.messages import String, Vector3, Vector3Stamped, Pose, PoseStamped, RBLaserScan
@@ -313,6 +313,9 @@ class LaptopController:
         # ---------------- LiDAR DBSCAN parameters and outputs ----------------
         self.lidar_dbscan_eps_m = 0.20
         self.lidar_dbscan_min_points = 3
+        self.lidar_fragment_merge_gap_m = 0.50
+        self.lidar_fragment_max_width_m = 0.65
+        self.lidar_fragment_max_length_m = 4.0
         self.lidar_points_body = np.empty((0, 2))
         self.lidar_points_ne = np.empty((0, 2))
         self.lidar_cluster_labels = np.array([], dtype=int)
@@ -398,6 +401,7 @@ class LaptopController:
         self.apf_dynamic_exit_speed_threshold_m_s = 0.04 if self.OPERATING_MODE == 2 else 0.03
         self.apf_track_association_m = 0.80 if self.OPERATING_MODE == 2 else 0.60
         self.apf_track_timeout_s = 1.5 if self.OPERATING_MODE == 2 else 1.0
+        self.obstacle_track_confirmation_hits = 3
         self.apf_next_track_id = 1
         self.apf_obstacle_tracks = []
         self.apf_obstacle_track_candidates = []
@@ -846,6 +850,13 @@ class LaptopController:
             min_samples=self.lidar_dbscan_min_points,
             n_jobs=1,
         ).fit_predict(self.lidar_points_body)
+        labels = merge_collinear_cluster_labels(
+            self.lidar_points_body,
+            labels,
+            max_gap_m=self.lidar_fragment_merge_gap_m,
+            max_width_m=self.lidar_fragment_max_width_m,
+            max_length_m=self.lidar_fragment_max_length_m,
+        )
         self.lidar_cluster_labels = labels
 
         obstacles = []
@@ -1098,6 +1109,9 @@ class LaptopController:
             "dbscan": {
                 "eps_m": self.lidar_dbscan_eps_m,
                 "min_samples": self.lidar_dbscan_min_points,
+                "fragment_merge_gap_m": self.lidar_fragment_merge_gap_m,
+                "fragment_max_width_m": self.lidar_fragment_max_width_m,
+                "fragment_max_length_m": self.lidar_fragment_max_length_m,
             },
         }
 
@@ -1801,6 +1815,7 @@ class LaptopController:
         predicted_tracks = []
         candidates = []
         matched_candidates = set()
+        promoted_candidates = set()
 
         for track_index, track in enumerate(self.apf_obstacle_tracks):
             dt = max(now - float(track.get("stamp_s", now)), 0.0)
@@ -1903,6 +1918,7 @@ class LaptopController:
                     self.apf_obstacle_tracks.append(track)
                     assigned_detections.add(detection_index)
                     detection_track[detection_index] = track
+                    promoted_candidates.add(best_candidate_index)
                 continue
 
             self.apf_obstacle_track_candidates.append(
@@ -1921,7 +1937,8 @@ class LaptopController:
 
         self.apf_obstacle_track_candidates = [
             candidate
-            for candidate in self.apf_obstacle_track_candidates
+            for candidate_index, candidate in enumerate(self.apf_obstacle_track_candidates)
+            if candidate_index not in promoted_candidates
             if now - float(candidate.get("last_seen_s", candidate.get("stamp_s", now))) <= self.apf_track_timeout_s
         ]
         self.prune_obstacle_tracks(now)

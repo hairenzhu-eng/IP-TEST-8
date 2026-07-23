@@ -559,6 +559,12 @@ class WebotsController(Supervisor):
 
 
         self.pose_msg = geometry_msgs.PoseStamped()
+        try:
+            world_path = self.getWorldPath()
+        except Exception as e:
+            print("Warning: could not read Webots world path:", e)
+            world_path = ""
+        self.pose_msg.header.frame_id = os.path.basename(world_path) if world_path else "WEBOTS_UNKNOWN"
 
         self.gps = self.getDevice("gps")
         self.gps.enable(self.timeStep)

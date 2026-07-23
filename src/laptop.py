@@ -11,7 +11,7 @@ from types import MethodType
 
 import numpy as np
 from behavior_tree import BTAction, BTCondition, BTSelector, BTSequence, BTStatus
-from colreg_apf import classify_colreg_zone, obstacle_stern_waypoint, smooth_ellipse_repulsion
+from colreg_apf import classify_colreg_zone, obstacle_stern_waypoint, smooth_ellipse_repulsion, straight_line_cpa
 
 
 _HERE = Path(__file__).resolve().parent
@@ -350,9 +350,9 @@ class LaptopController(_OvertakingController):
         return outer_scale * (0.5 * pc2_m + self.apf_own_equivalent_radius_m)
 
     def apf_pass_astern_side_from_velocity(self, obs_vel_body):
-        # Body y and planner side are both positive to port/left; the stern is
-        # therefore on the opposite side of the obstacle's lateral velocity.
-        return -_OvertakingController.apf_pass_astern_side_from_velocity(self, obs_vel_body)
+        # Body y and planner side are both positive to port/left.  The
+        # obstacle's trailing side uses the same sign in this planner.
+        return _OvertakingController.apf_pass_astern_side_from_velocity(self, obs_vel_body)
 
     # The APF has exactly two repulsive fields: the measured LiDAR ellipse and
     # the EKF/CPA-predicted ellipse.  COLREG still selects the controller, but
@@ -485,7 +485,8 @@ class LaptopController(_OvertakingController):
         if not np.isfinite(unit).all() or norm < 1e-9:
             return np.array([0.0, 1.0], dtype=float)
         unit = unit / norm
-        return np.array([-unit[1], unit[0]], dtype=float)
+        # Coordinates are [north, east]; positive planner side is port/left.
+        return np.array([unit[1], -unit[0]], dtype=float)
 
     def _point_on_main_route(self, along_m):
         along_m = float(np.clip(along_m, 0.0, self.route_path_length_m))
@@ -984,7 +985,7 @@ class LaptopController(_OvertakingController):
         return _OvertakingController.limit_heading_deviation_command(self, yaw_rate_cmd)
 
     def update_apf_obstacle_tracks(self, stamp_s):
-        _OvertakingController.update_apf_obstacle_tracks(self, stamp_s)
+        _CrossingController.update_apf_obstacle_tracks(self, stamp_s)
 
     def _run_context(self):
         return {
@@ -1121,6 +1122,35 @@ class LaptopController(_OvertakingController):
             return self.earth_vector_to_body(velocity_ne)
 
         return np.zeros(2, dtype=float)
+
+    def apf_track_for_obstacle(self, obstacle):
+        centre_ne = np.asarray(obstacle.get("centre_ne", [np.nan, np.nan]), dtype=float).reshape(2)
+        if not np.isfinite(centre_ne).all():
+            return None
+
+        now = float(self.latest_lidar_received_s if self.latest_lidar_received_s is not None else 0.0)
+        best_track = None
+        best_distance = np.inf
+        for track in self.apf_obstacle_tracks:
+            if now - float(track.get("last_seen_s", track.get("stamp_s", now))) > self.apf_track_timeout_s:
+                continue
+            pos_ne = np.asarray(track.get("pos_ne", [np.nan, np.nan]), dtype=float).reshape(2)
+            if not np.isfinite(pos_ne).all():
+                continue
+            distance = float(np.linalg.norm(centre_ne - pos_ne))
+            if distance < best_distance:
+                best_distance = distance
+                best_track = track
+
+        if best_distance <= max(self.apf_track_association_m * 1.5, self.lidar_dbscan_eps_m * 2.0):
+            return best_track
+        return None
+
+    def apf_cpa_metrics(self, obs_pos_body, obs_vel_body, own_vel_body):
+        tcpa_s, dcpa_m, _, _ = straight_line_cpa(
+            [0.0, 0.0], own_vel_body, obs_pos_body, obs_vel_body
+        )
+        return tcpa_s, dcpa_m
 
     def _rule_priority(self, rule):
         if rule == "head_on":
@@ -1342,6 +1372,23 @@ class LaptopController(_OvertakingController):
 
     # crossing/overtaking/head_on dispatch location.
     def compute_apf_control(self, t, u_track):
+        if not self.obstacle_ekf_prediction_enabled:
+            # EKF-off mode is local: no predicted-trajectory state may survive.
+            self._clear_apf_waypoint_path()
+            self.apf_side_lock_sign = 0.0
+            self.apf_side_lock_active = False
+            self.apf_colreg_active = False
+            self.apf_colreg_rule = "none"
+            self.apf_colreg_dcpa_m = np.nan
+            self.apf_colreg_tcpa_s = np.nan
+
+            # Use the local ellipse-field composition, which suppresses route
+            # attraction in close quarters; the legacy default controller lets
+            # attraction overwhelm the measured obstacle field.
+            u_cmd = _CrossingController.compute_apf_control(self, t, u_track)
+            self.apf_waypoint_speed_m_s = self._waypoint_speed_from_command(u_cmd)
+            return u_cmd
+
         selected_rule = self.select_colreg_strategy()
         u_cmd = self._tick_colreg_bt(selected_rule, t, u_track)
         if u_cmd is None:

@@ -3,6 +3,68 @@
 import numpy as np
 
 
+def merge_collinear_cluster_labels(
+    points,
+    labels,
+    max_gap_m=0.50,
+    max_width_m=0.65,
+    max_length_m=4.0,
+    min_aspect_ratio=1.5,
+):
+    """Merge nearby DBSCAN fragments that form one elongated obstacle hull."""
+    points = np.asarray(points, dtype=float)
+    labels = np.asarray(labels, dtype=int)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) != len(labels):
+        raise ValueError("points must be Nx2 and labels must have length N")
+
+    groups = [[int(label)] for label in sorted(set(labels) - {-1})]
+
+    def group_points(group):
+        return points[np.isin(labels, group)]
+
+    def can_merge(left, right):
+        left_points = group_points(left)
+        right_points = group_points(right)
+        gap_m = float(np.min(np.linalg.norm(
+            left_points[:, None, :] - right_points[None, :, :], axis=2
+        )))
+        if gap_m > float(max_gap_m):
+            return False
+
+        combined = np.vstack((left_points, right_points))
+        centred = combined - np.mean(combined, axis=0)
+        covariance = centred.T @ centred / max(len(combined) - 1, 1)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+        normal = np.array([-axis[1], axis[0]])
+        length_m = float(np.ptp(centred @ axis))
+        width_m = float(np.ptp(centred @ normal))
+        aspect_ratio = length_m / max(width_m, 0.05)
+        return (
+            length_m <= float(max_length_m)
+            and width_m <= float(max_width_m)
+            and aspect_ratio >= float(min_aspect_ratio)
+        )
+
+    merged = True
+    while merged:
+        merged = False
+        for left_index in range(len(groups)):
+            for right_index in range(left_index + 1, len(groups)):
+                if not can_merge(groups[left_index], groups[right_index]):
+                    continue
+                groups[left_index].extend(groups.pop(right_index))
+                merged = True
+                break
+            if merged:
+                break
+
+    result = labels.copy()
+    for merged_label, group in enumerate(groups):
+        result[np.isin(labels, group)] = merged_label
+    return result
+
+
 def straight_line_cpa(own_position, own_velocity, obstacle_position, obstacle_velocity, horizon_s=None):
     """Continuous-time CPA for two constant-velocity trajectories."""
     own_position = np.asarray(own_position, dtype=float).reshape(2)

@@ -252,6 +252,13 @@ def find_primary_csv(run_dir):
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def known_world_name(world_name):
+    return bool(world_name) and str(world_name).strip().lower() not in {
+        "webots_unknown",
+        "unknown_webots",
+    }
+
+
 def load_run_metadata_from_csv(run_dir):
     with find_primary_csv(run_dir).open(newline="", encoding="utf-8-sig") as stream:
         first_row = next(csv.DictReader(stream), None)
@@ -259,9 +266,19 @@ def load_run_metadata_from_csv(run_dir):
         return None
     world_name = Path(str(first_row.get("WebotsEnvironment") or "").strip()).name
     combination = switch_combination_name(first_row)
-    if not world_name or not combination:
+    if not known_world_name(world_name) or not combination:
         return None
     return RunSelection(Path(run_dir).resolve(), world_name, combination)
+
+
+def load_run_metadata(run_dir):
+    run_dir = Path(run_dir)
+    summary = _read_json(run_dir / "run_summary.json")
+    world_name = Path(str(summary.get("webots_environment") or "").strip()).name
+    combination = str(summary.get("switch_combination") or "").strip().lower()
+    if known_world_name(world_name) and combination:
+        return RunSelection(run_dir.resolve(), world_name, combination)
+    return load_run_metadata_from_csv(run_dir)
 
 
 def latest_matrix_dirs(logs_dir):
@@ -297,15 +314,24 @@ def load_latest_world_runs(logs_dir, combination="ekf_on_cluster_on"):
                 continue
             world_name = Path(str(item.get("world") or "")).name
             run_dir_text = item.get("run_dir")
-            if not world_name or not run_dir_text or world_name in latest_by_world:
+            if not known_world_name(world_name) or not run_dir_text or world_name in latest_by_world:
                 continue
             run_dir = (PROJECT_ROOT / str(run_dir_text)).resolve()
-            if run_dir.is_dir() and has_snapshot_logs(run_dir):
-                latest_by_world[world_name] = RunSelection(
+            if not run_dir.is_dir() or not has_snapshot_logs(run_dir):
+                continue
+            try:
+                selection = load_run_metadata(run_dir)
+            except (FileNotFoundError, OSError, ValueError):
+                selection = None
+            if selection is None:
+                selection = RunSelection(
                     run_dir=run_dir,
                     world_name=world_name,
                     combination=combination,
                 )
+            if selection.combination != combination or not known_world_name(selection.world_name):
+                continue
+            latest_by_world[selection.world_name] = selection
     if latest_by_world:
         return sorted(latest_by_world.values(), key=lambda item: Path(item.world_name).stem)
 
@@ -313,7 +339,7 @@ def load_latest_world_runs(logs_dir, combination="ekf_on_cluster_on"):
         if not has_snapshot_logs(run_dir):
             continue
         try:
-            selection = load_run_metadata_from_csv(run_dir)
+            selection = load_run_metadata(run_dir)
         except (FileNotFoundError, OSError, ValueError):
             continue
         if selection is None or selection.combination != combination:
@@ -324,6 +350,28 @@ def load_latest_world_runs(logs_dir, combination="ekf_on_cluster_on"):
 
 def world_output_dir(output_dir, world_name):
     return Path(output_dir) / Path(world_name).stem
+
+
+def snapshot_world_name(snapshots):
+    for snapshot in snapshots:
+        run_context = snapshot.get("payload", {}).get("run_context", {})
+        if isinstance(run_context, dict):
+            world_name = Path(str(run_context.get("webots_environment") or "").strip()).name
+            if known_world_name(world_name):
+                return world_name
+    return None
+
+
+def run_world_name(run_dir, snapshots=None):
+    try:
+        selection = load_run_metadata(run_dir)
+    except (FileNotFoundError, OSError, ValueError):
+        selection = None
+    if selection is not None and selection.world_name:
+        return selection.world_name
+    if snapshots is not None:
+        return snapshot_world_name(snapshots)
+    return None
 
 
 def point(value):
@@ -658,6 +706,15 @@ def select_snapshot_indices(snapshots, interval_s):
     return indices
 
 
+def snapshot_target_times(duration_s, interval_s):
+    interval_s = positive(interval_s, 5.0)
+    duration_s = max(float(duration_s), 0.0)
+    targets = np.arange(0.0, duration_s + 1e-9, interval_s).tolist()
+    if not targets or duration_s - targets[-1] > 0.05:
+        targets.append(duration_s)
+    return targets
+
+
 def obstacle_dimensions(obstacle, settings):
     minimum_pc1_m = positive(settings.get("minimum_pc1_m"), 0.30)
     minimum_pc2_m = positive(settings.get("minimum_pc2_m"), 0.16)
@@ -900,9 +957,54 @@ def webots_truth_path(payload):
     return np.asarray(values, dtype=float) if values else np.empty((0, 2), dtype=float)
 
 
+def obstacle_reference_points(payload):
+    values = [
+        point(item.get("position_ne", item.get("centre_ne")))
+        for name in ("tracks", "clusters")
+        for item in payload.get(name, [])
+        if isinstance(item, dict)
+    ]
+    values = [value for value in values if value is not None]
+    return np.asarray(values, dtype=float) if values else np.empty((0, 2), dtype=float)
+
+
 def webots_truth_run_path(snapshots):
-    values = [webots_truth_path(snapshot["payload"]) for snapshot in snapshots]
-    return np.asarray([path[-1] for path in values if len(path)], dtype=float)
+    values = []
+    anchors = []
+    for snapshot in snapshots:
+        payload = snapshot["payload"]
+        path = webots_truth_path(payload)
+        if not len(path):
+            continue
+        position = path[-1]
+        values.append(position)
+        references = obstacle_reference_points(payload)
+        if len(references) and float(np.min(np.linalg.norm(references - position, axis=1))) <= 2.5:
+            anchors.append(position)
+
+    values = np.asarray(values, dtype=float)
+    anchors = np.asarray(anchors, dtype=float)
+    if len(anchors) < 2:
+        return values
+
+    centred_anchors = anchors - np.mean(anchors, axis=0)
+    _, _, axes = np.linalg.svd(centred_anchors, full_matrices=False)
+    normal = axes[-1]
+    line_distance = np.abs((values - np.mean(anchors, axis=0)) @ normal)
+    return values[line_distance <= 0.35]
+
+
+def webots_truth_position(payload, run_path):
+    path = webots_truth_path(payload)
+    if not len(run_path):
+        return path[-1] if len(path) else None
+    if len(path) and float(np.min(np.linalg.norm(run_path - path[-1], axis=1))) <= 0.35:
+        return path[-1]
+    references = obstacle_reference_points(payload)
+    if not len(references):
+        return None
+    distances = np.linalg.norm(run_path[:, None, :] - references[None, :, :], axis=2)
+    return run_path[np.unravel_index(int(np.argmin(distances)), distances.shape)[0]]
 
 
 def colreg_snapshot_label(payload):
@@ -951,8 +1053,11 @@ def all_run_points(snapshots):
     return np.asarray(points, dtype=float)
 
 
-def run_bounds(snapshots, map_size_m=20.0):
+def run_bounds(snapshots, map_size_m=20.0, extra_points=None):
     points = all_run_points(snapshots)
+    extra_points = point_cloud(extra_points)
+    if len(extra_points):
+        points = np.vstack((points, extra_points)) if len(points) else extra_points
     if len(points) == 0:
         return (-2.0, 2.0, -2.0, 2.0)
     north_min, east_min = np.min(points, axis=0)
@@ -1457,16 +1562,16 @@ def _plot_snapshot_legacy(
             zorder=7,
         ))
 
-    truth_path = webots_truth_path(payload)
+    truth_position = webots_truth_position(payload, webots_run_path)
     truth_plot = break_path_jumps(webots_run_path)
     if len(webots_run_path) >= 2:
         ax.plot(
             truth_plot[:, 1], truth_plot[:, 0], color="#00c2c7",
             linewidth=2.4, linestyle=":", label="Webots true obstacle path", zorder=6,
         )
-    if len(truth_path):
+    if truth_position is not None:
         ax.scatter(
-            [truth_path[-1, 1]], [truth_path[-1, 0]], marker="D", s=60,
+            [truth_position[1]], [truth_position[0]], marker="D", s=60,
             facecolors="#00c2c7", edgecolors="black", linewidth=0.6,
             label="Webots true obstacle position", zorder=9,
         )
@@ -1561,36 +1666,71 @@ def generate_snapshots(
     run_dir = Path(run_dir)
     snapshots = load_snapshots(run_dir)
     robot_times_s, robot_trajectory_ne = load_robot_trajectory(run_dir)
+    try:
+        stop_times_s, stop_trajectory_ne = read_trajectory_samples_csv(
+            find_primary_csv(run_dir), OWN_NORTH_COLUMNS, OWN_EAST_COLUMNS
+        )
+    except (FileNotFoundError, ValueError):
+        stop_times_s, stop_trajectory_ne = robot_times_s, robot_trajectory_ne
+    tail = stop_times_s > robot_times_s[-1]
+    if np.any(tail):
+        robot_times_s = np.concatenate((robot_times_s, stop_times_s[tail]))
+        robot_trajectory_ne = np.vstack((robot_trajectory_ne, stop_trajectory_ne[tail]))
     run_collision_outcome = collision_outcome_text(run_dir)
-    selected_indices = select_snapshot_indices(snapshots, interval_s)
     colreg_label = run_colreg_label(snapshots)
+    world_name = run_world_name(run_dir, snapshots)
     output_dir = (
         Path(output_dir)
         if output_dir is not None
-        else DEFAULT_OUTPUT_DIR / f"{run_dir.name}_apf_snapshots"
+        else world_output_dir(DEFAULT_BATCH_OUTPUT_DIR, world_name or run_dir.name)
     )
-    if output_dir.name.lower() in {"webots_unknown", "unknown_webots"}:
-        output_dir = output_dir.parent / colreg_label
     output_dir.mkdir(parents=True, exist_ok=True)
     for old_snapshot in output_dir.glob("apf_snapshot_*.png"):
         old_snapshot.unlink()
-    bounds = run_bounds(snapshots, map_size_m)
+    bounds = run_bounds(snapshots, map_size_m, robot_trajectory_ne)
     webots_run_path = webots_truth_run_path(snapshots)
     default_target_ne = point(snapshots[-1]["payload"].get("robot_pos"))
+    snapshot_start_s = snapshots[0]["time_s"]
+    stop_relative_s = max(float(stop_times_s[-1]) - snapshot_start_s, 0.0)
+    target_times_s = snapshot_target_times(stop_relative_s, interval_s)
+    snapshot_relative_times = np.asarray(
+        [snapshot["relative_time_s"] for snapshot in snapshots], dtype=float
+    )
+    last_snapshot_relative_s = float(snapshot_relative_times[-1])
+    run_summary = _read_json(run_dir / "run_summary.json")
 
     outputs = []
-    selected_targets = {
-        index: selected_order * positive(interval_s, 5.0)
-        for selected_order, index in enumerate(selected_indices)
-    }
-    for index, snapshot in enumerate(snapshots):
-        if index not in selected_targets:
-            continue
-        target_time_s = selected_targets[index]
-        snapshot_time_s = parse_float(snapshot["payload"].get("t"))
-        history_end = np.searchsorted(robot_times_s, snapshot_time_s, side="right")
+    for target_time_s in target_times_s:
+        source_index = int(np.argmin(np.abs(snapshot_relative_times - min(
+            target_time_s, last_snapshot_relative_s
+        ))))
+        source_snapshot = snapshots[source_index]
+        snapshot = source_snapshot
+        target_absolute_s = snapshot_start_s + target_time_s
+        history_end = np.searchsorted(robot_times_s, target_absolute_s, side="right")
         robot_history = robot_trajectory_ne[:max(history_end, 1)]
         robot_position = robot_history[-1]
+        if target_time_s > last_snapshot_relative_s:
+            payload = copy.deepcopy(source_snapshot["payload"])
+            payload.update(
+                t=target_absolute_s,
+                robot_pos=robot_position.tolist(),
+                cloud=[],
+                clusters=[],
+                tracks=[],
+                virtual_obstacles=[],
+            )
+            apf = payload.get("apf", {})
+            if isinstance(apf, dict):
+                apf.update(encounter="none", colreg_rule="none")
+                if abs(target_time_s - stop_relative_s) <= 0.05:
+                    apf["navigation_mode"] = run_summary.get("navigation_mode", "arrived")
+            snapshot = dict(
+                source_snapshot,
+                time_s=target_absolute_s,
+                relative_time_s=target_time_s,
+                payload=payload,
+            )
         output_path = output_dir / f"apf_snapshot_{colreg_label}_{target_time_s:06.1f}s.png"
         plot_snapshot(
             snapshot=snapshot,
@@ -1631,11 +1771,10 @@ def generate_latest_world_snapshots(
 
     generated = {}
     for selection in selections:
-        colreg_name = run_colreg_label(load_snapshots(selection.run_dir))
         print(f"Snapshot log: {selection.run_dir}")
         generated[selection.world_name] = generate_snapshots(
             run_dir=selection.run_dir,
-            output_dir=world_output_dir(output_dir, colreg_name),
+            output_dir=world_output_dir(output_dir, selection.world_name),
             interval_s=interval_s,
             grid_size=grid_size,
             k_goal=k_goal,
@@ -1652,6 +1791,9 @@ def _self_check():
     assert world_output_dir(Path("x"), "mr_webots_head_on_small_ship.wbt").as_posix().endswith(
         "x/mr_webots_head_on_small_ship"
     )
+    assert snapshot_world_name([
+        {"payload": {"run_context": {"webots_environment": "mr_webots_head_on_small_ship.wbt"}}}
+    ]) == "mr_webots_head_on_small_ship.wbt"
     assert colreg_snapshot_label({"apf": {"colreg_rule": "crossing/pass astern"}}) == "crossing_pass_astern"
     assert run_colreg_label([
         {"payload": {"apf": {"colreg_rule": "none"}}},
@@ -1663,12 +1805,22 @@ def _self_check():
         {"payload": {"webots_obstacle_truth": [{"position_ne": [1, 2]}]}},
         {"payload": {"webots_obstacle_truth": [{"position_ne": [3, 4]}]}},
     ]).tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    mixed_truth = [
+        {"payload": {"tracks": [{"position_ne": [4.8, 0.0]}], "webots_obstacle_truth": [{"position_ne": [4.8, 0.0]}]}},
+        {"payload": {"tracks": [{"position_ne": [4.8, 1.0]}], "webots_obstacle_truth": [{"position_ne": [4.8, 1.0]}]}},
+        {"payload": {"tracks": [{"position_ne": [4.8, 2.0]}], "webots_obstacle_truth": [{"position_ne": [2.0, -1.0]}]}},
+    ]
+    filtered_truth = webots_truth_run_path(mixed_truth)
+    assert filtered_truth.tolist() == [[4.8, 0.0], [4.8, 1.0]]
+    assert np.allclose(webots_truth_position(mixed_truth[-1]["payload"], filtered_truth), [4.8, 1.0])
     assert [1.0, 2.0] in all_run_points([
         {"payload": {"webots_obstacle_truth": [{"position_ne": [1, 2]}]}}
     ]).tolist()
     broken = break_path_jumps([[0.0, 0.0], [2.0, 0.0], [2.1, 0.0]])
     assert np.isnan(broken[1]).all()
     assert np.searchsorted([0.0, 1.0], 0.4, side="right") == 1
+    assert snapshot_target_times(12.3, 5.0) == [0.0, 5.0, 10.0, 12.3]
+    assert snapshot_target_times(10.0, 5.0) == [0.0, 5.0, 10.0]
 
 
 def main():
